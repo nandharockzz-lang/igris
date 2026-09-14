@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""Read and write ~/.config/jarvis/config.toml from outside Python.
+
+The bar widget's settings panel is QML, which has no TOML support, so it
+shells out to this. Two commands:
+
+    jarvis-config show            effective settings as JSON
+    jarvis-config set KEY VALUE   change one setting
+
+`set` rewrites a single line in place rather than re-serialising the file,
+so the comments people rely on when hand-editing survive.
+"""
+
+import argparse
+import importlib.util
+import json
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import safefile  # noqa: E402  (needs HERE on the path first)
+
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+    os.path.expanduser("~"), ".config")
+CONFIG_PATH = os.path.join(CONFIG_HOME, "jarvis", "config.toml")
+
+
+def load_daemon():
+    """Import jarvis-listen.py for DEFAULTS/merge/Agent, so the two agree."""
+    path = os.path.join(HERE, "jarvis-listen.py")
+    spec = importlib.util.spec_from_file_location("jarvis_listen", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Only these may be written from the panel. Anything touching how an agent is
+# invoked stays in the file, editable by hand -- a GUI that can rewrite argv
+# is a GUI that can be talked into running something. `mode` is settable
+# because picking it in the panel IS the explicit physical action workspace
+# mode requires -- but the daemon still enforces every mode invariant at
+# startup, so no click can silently grant more than the mode allows.
+WRITABLE = {
+    "agent":                  "str",
+    "mode":                   "str",
+    "wake_word":              "str",
+    "voice":                  "str",
+    "listen.wake_threshold":  "float",
+    "listen.silence_tail":    "float",
+    "listen.min_speech":      "float",
+    "listen.max_command":     "float",
+    "listen.cooldown":        "float",
+    "workspace.auto_disarm_seconds": "float",
+    "workspace.full_disarm_seconds": "float",
+}
+
+
+# A control character in a string value would be written into config.toml
+# literally. A newline in particular ends the `key = "value"` line early and
+# turns the rest of the value into further TOML -- which does not become an
+# injected [agents.*] section (the value's opening quote is never closed, so
+# the file stops parsing), but it does silently corrupt the config. The
+# daemon then falls back to DEFAULTS on its next restart, quietly dropping
+# every agent, key and setting the user had configured. Fail on the write
+# instead of failing silently later.
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def coerce(key, raw):
+    kind = WRITABLE[key]
+    if kind == "float":
+        try:
+            return float(raw)
+        except ValueError:
+            raise SystemExit(f"{key} must be a number, got {raw!r}")
+    if CONTROL_CHARS.search(raw):
+        raise SystemExit(f"{key} may not contain control characters")
+    return raw
+
+
+def validate(daemon, key, value, config_path):
+    """Reject values the daemon would refuse at startup, while the panel can
+    still show an error -- better than a listener that dies on restart."""
+    if key == "wake_word" and value not in daemon.WAKE_WORDS:
+        raise SystemExit(f"unknown wake_word {value!r}. "
+                         f"Available: {', '.join(daemon.WAKE_WORDS)}")
+    if key == "agent":
+        cfg = daemon.load_config(config_path)
+        if value not in cfg.get("agents", {}):
+            known = ", ".join(sorted(cfg.get("agents", {})))
+            raise SystemExit(f"unknown agent {value!r}. Configured: {known}")
+    if key == "mode" and value not in daemon.MODES:
+        raise SystemExit(f"unknown mode {value!r}. "
+                         f"Available: {', '.join(daemon.MODES)}")
+    if key == "mode" and value != "safe":
+        cfg = daemon.load_config(config_path)
+        try:
+            agent = daemon.Agent(cfg.get("agent", ""),
+                                 cfg.get("agents", {}).get(
+                                     cfg.get("agent", ""), {}))
+        except ValueError as exc:
+            raise SystemExit(f"cannot switch mode: {exc}")
+        problems = daemon.check_mode_invariants(value, agent)
+        if problems:
+            raise SystemExit(f"mode {value!r} refused: {problems[0]}")
+    if key == "mode" and value == "safe":
+        # Safe + actions=true can never start (the daemon refuses it), so
+        # accepting the write would brick the listener on next restart.
+        # Disarm via the toggle or panel avatar first (both return the flag),
+        # or hand-edit actions=false.
+        cfg = daemon.load_config(config_path)
+        name = cfg.get("agent", "")
+        if cfg.get("agents", {}).get(name, {}).get("actions", False):
+            raise SystemExit(
+                "mode 'safe' refused while actions=true: Safe never acts. "
+                "Disarm first (toggle/panel avatar returns the flag), or "
+                "hand-edit actions=false.")
+    if key == "voice":
+        path = value if os.path.isabs(value) else os.path.join(voices_dir(), value)
+        if not os.path.exists(path):
+            raise SystemExit(f"no such voice file: {path}")
+    if key == "listen.wake_threshold" and not 0.0 < value <= 1.0:
+        raise SystemExit("wake_threshold must be between 0 and 1")
+    if key == "workspace.auto_disarm_seconds" and not 60 <= value <= 3600:
+        raise SystemExit("workspace.auto_disarm_seconds must be 60-3600")
+    if key == "workspace.full_disarm_seconds" and not 60 <= value <= 3600:
+        raise SystemExit("workspace.full_disarm_seconds must be 60-3600")
+    if key.startswith("listen.") and key != "listen.wake_threshold" and value <= 0:
+        raise SystemExit(f"{key} must be positive")
+
+
+def format_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        # Keep it looking like the hand-written file: 1.2 not 1.2000000001
+        return f"{value:g}"
+    if isinstance(value, (int,)):
+        return str(value)
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# Piper voices, each verified to resolve on HuggingFace. An id is
+# {lang}-{name}-{quality}, which is enough to rebuild its URL, so this stays a
+# flat list rather than a table of paths. Anything not listed here still works
+# -- put an absolute path in `voice` and Jarvis will use it.
+VOICE_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
+VOICE_CATALOG = [
+    "en_US-amy-medium",
+    "en_US-lessac-medium",
+    "en_US-ryan-medium",
+    "en_US-joe-medium",
+    "en_US-kusal-medium",
+    "en_US-hfc_female-medium",
+    "en_US-bryce-medium",
+    "en_GB-alan-medium",
+    "en_GB-cori-medium",
+    "en_GB-northern_english_male-medium",
+]
+
+
+def voice_url(vid, suffix=".onnx"):
+    lang, name, quality = vid.split("-")
+    family = lang.split("_")[0]
+    return f"{VOICE_BASE}/{family}/{lang}/{name}/{quality}/{vid}{suffix}"
+
+
+def voices_dir():
+    return os.path.join(os.path.expanduser("~"), ".local", "share",
+                        "jarvis", "voices")
+
+
+def installed_voices():
+    d = voices_dir()
+    if not os.path.isdir(d):
+        return []
+    return sorted(f for f in os.listdir(d) if f.endswith(".onnx"))
+
+
+TABLE_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+
+
+def set_key(path, dotted, value):
+    """Replace one `key = value` line, preserving comments and layout.
+
+    The key may be top-level ("agent") or one level deep ("listen.cooldown").
+    Missing tables and missing keys are created.
+    """
+    table, _, leaf = dotted.rpartition(".")
+    rendered = f"{leaf} = {format_value(value)}"
+
+    try:
+        # The config path is predictable and this runs behind a GUI button,
+        # so read it descriptor-first: no symlink, no blocking on a planted
+        # FIFO, and a ceiling on how much we will pull in.
+        lines = safefile.read_text(path, safefile.MAX_CONFIG_BYTES).splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError as exc:
+        raise SystemExit(f"cannot read {path}: {exc}")
+
+    key_re = re.compile(rf"^(\s*){re.escape(leaf)}(\s*)=", re.ASCII)
+
+    def trailing_comment(line):
+        """The ` # ...` tail of a line, ignoring any # inside a quoted value."""
+        quote = None
+        for i, ch in enumerate(line):
+            if quote:
+                if ch == quote and line[i - 1] != "\\":
+                    quote = None
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "#":
+                pad = len(line[:i]) - len(line[:i].rstrip())
+                return " " * max(1, pad) + line[i:]
+        return ""
+
+    current = ""          # table we are inside of, "" for top level
+    table_end = None      # last line index belonging to the target table
+    for i, line in enumerate(lines):
+        match = TABLE_RE.match(line)
+        if match:
+            current = match.group(1).strip()
+            if current == table:
+                table_end = i
+            continue
+        if current == table:
+            if line.strip():
+                table_end = i
+            if key_re.match(line):
+                # Preserve the original indentation and alignment.
+                indent = key_re.match(line).group(1)
+                lines[i] = f"{indent}{rendered}{trailing_comment(line)}"
+                write(path, lines)
+                return "updated"
+
+    # Key absent: append to its table, creating the table if needed.
+    if table and table_end is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(f"[{table}]")
+        lines.append(rendered)
+    elif table_end is None:
+        lines.insert(0, rendered)
+    else:
+        lines.insert(table_end + 1, rendered)
+    write(path, lines)
+    return "added"
+
+
+def write(path, lines):
+    """Replace the config atomically.
+
+    The old `path + ".tmp"` was a predictable name a local attacker could
+    pre-plant as a symlink to redirect the write. safefile.write_atomic
+    creates an unpredictable 0600 file in the same directory and renames it
+    over the target, so a concurrent reader sees the old file or the new one.
+    """
+    safefile.write_atomic(path, "\n".join(lines).rstrip("\n") + "\n")
+
+
+def live_state(daemon):
+    """The daemon's authoritative runtime state (what the widget reads).
+
+    The panel displays this -- it never defines it. Requests (hotkey, widget,
+    panel) only write config; the daemon validates and republishes on start.
+    All values are daemon-published tokens/epochs, never content.
+    """
+    import time
+    live = {"mode": "safe", "armed": False, "remaining": 0}
+    try:
+        mode = safefile.read_text(daemon.MODE_FILE, 64).strip()
+        if mode in daemon.MODES:
+            live["mode"] = mode
+    except OSError:
+        return live
+    try:
+        import subprocess
+        proc = subprocess.run(["systemctl", "--user", "is-active", "jarvis"],
+                              capture_output=True, timeout=5, text=True)
+        running = proc.stdout.strip() == "active"
+    except OSError:
+        running = False
+    if not running:
+        return live
+    try:
+        deadline = float(safefile.read_text(daemon.ARM_FILE, 64).strip())
+    except (OSError, ValueError):
+        deadline = None
+    if live["mode"] == "safe":
+        live["armed"] = True  # always-on by definition while started
+    elif deadline is not None:
+        remaining = int(deadline - time.time())
+        if remaining > 0:
+            live["armed"] = True
+            live["remaining"] = remaining
+    return live
+
+
+def cmd_show(daemon, args):
+    cfg = daemon.load_config(args.config)
+    listen = daemon.merge(daemon.DEFAULTS["listen"], cfg.get("listen", {}))
+    workspace = daemon.merge(daemon.DEFAULTS["workspace"],
+                             cfg.get("workspace", {}))
+
+    agents = []
+    for name in sorted(cfg.get("agents", {})):
+        try:
+            agent = daemon.Agent(name, cfg["agents"][name])
+        except ValueError:
+            continue
+        agents.append({
+            "name": name,
+            "actions": agent.actions,
+            "web": agent.web,
+            "installed": bool(__import__("shutil").which(agent.executable)),
+            # What the daemon can honestly say about this CLI's own tools.
+            # The panel must not infer "answer-only" from `actions`: that flag
+            # governs Jarvis's directive broker, not the CLI's tools.
+            "tools": daemon.tool_posture(agent.executable, agent.command),
+        })
+
+    print(json.dumps({
+        "config_path": args.config,
+        "agent": cfg.get("agent"),
+        "mode": cfg.get("mode", "safe"),
+        "modes": list(daemon.MODES),
+        "live": live_state(daemon),
+        "workspace": workspace,
+        "wake_word": cfg.get("wake_word"),
+        "voice": cfg.get("voice"),
+        "listen": listen,
+        "agents": agents,
+        "wake_words": list(daemon.WAKE_WORDS),
+        "voices": voice_list(),
+    }, indent=2))
+    return 0
+
+
+def voice_list():
+    """Every voice the panel may offer: what is on disk, plus the catalog."""
+    on_disk = installed_voices()
+    out = [{"id": os.path.splitext(f)[0], "file": f, "installed": True}
+           for f in on_disk]
+    known = {v["id"] for v in out}
+    for vid in VOICE_CATALOG:
+        if vid not in known:
+            out.append({"id": vid, "file": vid + ".onnx", "installed": False})
+    return out
+
+
+# A piper medium voice is ~63MB and its metadata a few KB. Both ceilings are
+# generous; they exist so a redirected or hostile response cannot fill the
+# disk while the panel sits there spinning.
+MAX_VOICE_BYTES = 256 << 20
+MAX_META_BYTES = 1 << 20
+
+
+# Every voice the panel can install, locked to the sha256 HuggingFace served
+# when tools/genvoicelock.py was last run. install.sh has always verified the
+# default voice this way; the picker downloads the other nine, and a voice
+# file is parsed by onnxruntime, so it gets the same treatment rather than
+# being trusted because it arrived over TLS.
+VOICE_LOCK = os.path.join(HERE, "voices.sha256")
+
+
+def voice_hashes():
+    """{filename: sha256} from the committed lock, or {} if it is missing."""
+    try:
+        text = safefile.read_text(VOICE_LOCK, safefile.MAX_CONFIG_BYTES)
+    except OSError:
+        return {}
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        digest, _, name = line.partition("  ")
+        if digest and name:
+            out[name.strip()] = digest.strip()
+    return out
+
+
+def fetch(url, dest, limit, expected):
+    """Download to a private temp file, verify, then rename.
+
+    Nothing lands at `dest` until the bytes hash to `expected`, so a failed
+    or tampered transfer leaves no half-written voice for piper to choke on
+    and no unverified model for onnxruntime to parse. The temp file is
+    unpredictably named inside the destination directory rather than the old,
+    guessable `dest + ".part"`, and the transfer stops at `limit` bytes
+    instead of writing whatever the server keeps sending.
+    """
+    import hashlib
+    import urllib.error
+    import urllib.request
+
+    try:
+        with safefile.private_temp(dest, suffix=".part") as (fd, tmp):
+            digest = hashlib.sha256()
+            written = 0
+            with os.fdopen(fd, "wb") as fh:
+                with urllib.request.urlopen(url, timeout=120) as response:
+                    while True:
+                        chunk = response.read(1 << 16)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > limit:
+                            raise SystemExit(
+                                f"download exceeded {limit} bytes; aborted")
+                        digest.update(chunk)
+                        fh.write(chunk)
+            got = digest.hexdigest()
+            if got != expected:
+                raise SystemExit(
+                    f"checksum mismatch for {os.path.basename(dest)}: "
+                    f"expected {expected}, got {got}. Refusing to install it.")
+            safefile.commit(tmp, dest, 0o644)
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"download failed: {exc.reason}")
+
+
+def cmd_install_voice(daemon, args):
+    vid = args.voice
+    if vid not in VOICE_CATALOG:
+        raise SystemExit(f"unknown voice {vid!r}. "
+                         f"Known: {', '.join(VOICE_CATALOG)}")
+
+    target_dir = voices_dir()
+    os.makedirs(target_dir, exist_ok=True)
+    onnx = os.path.join(target_dir, vid + ".onnx")
+    meta = onnx + ".json"
+
+    expected = voice_hashes()
+    if not expected:
+        raise SystemExit(f"no voice checksums at {VOICE_LOCK}; "
+                         "refusing to download an unverifiable voice")
+    for name in (vid + ".onnx", vid + ".onnx.json"):
+        if name not in expected:
+            raise SystemExit(f"{name} is not in {VOICE_LOCK}; "
+                             "refusing to download an unverifiable voice")
+
+    if not os.path.exists(onnx):
+        fetch(voice_url(vid), onnx, MAX_VOICE_BYTES, expected[vid + ".onnx"])
+    if not os.path.exists(meta):
+        fetch(voice_url(vid, ".onnx.json"), meta, MAX_META_BYTES,
+              expected[vid + ".onnx.json"])
+
+    # A truncated download and an HTML error page both land as a small file;
+    # either one would fail later inside piper with nothing useful to show.
+    if os.path.getsize(onnx) < 1_000_000:
+        os.unlink(onnx)
+        raise SystemExit("downloaded voice looks truncated; try again")
+    try:
+        json.loads(safefile.read_text(meta, MAX_META_BYTES))
+    except (OSError, ValueError):
+        raise SystemExit("voice metadata is not valid JSON; try again")
+
+    print(f"installed {vid}")
+    return 0
+
+
+def cmd_set(daemon, args):
+    if args.key not in WRITABLE:
+        raise SystemExit(f"{args.key!r} is not settable from here. "
+                         f"Settable: {', '.join(sorted(WRITABLE))}")
+    value = coerce(args.key, args.value)
+    validate(daemon, args.key, value, args.config)
+    result = set_key(args.config, args.key, value)
+    print(f"{result} {args.key} = {format_value(value)}")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="jarvis-config")
+    parser.add_argument("--config", default=CONFIG_PATH)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("show", help="print effective settings as JSON")
+    setp = sub.add_parser("set", help="change one setting")
+    setp.add_argument("key")
+    setp.add_argument("value")
+    iv = sub.add_parser("install-voice", help="download a piper voice")
+    iv.add_argument("voice")
+
+    args = parser.parse_args()
+    daemon = load_daemon()
+    return {
+        "show": cmd_show,
+        "set": cmd_set,
+        "install-voice": cmd_install_voice,
+    }[args.cmd](daemon, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

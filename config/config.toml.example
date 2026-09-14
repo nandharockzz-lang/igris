@@ -1,0 +1,250 @@
+# Jarvis configuration. Copy to ~/.config/jarvis/config.toml and edit.
+# Every value here is a default -- delete anything you don't want to change.
+
+# Which agent below answers. Must match an [agents.*] section.
+agent = "claude"
+
+# Wake word. These four ship with openWakeWord; no download needed:
+#   hey_jarvis  alexa  hey_mycroft  hey_marvin
+wake_word = "hey_jarvis"
+
+# Piper voice file, relative to ~/.local/share/jarvis/voices/ or absolute.
+voice = "en_US-amy-medium.onnx"
+
+# Write what you said, and the reply, to the journal. Off by default: words
+# spoken near an open microphone can carry secrets, and journald persists
+# them. When false the journal records sizes and outcomes, never the words.
+log_transcripts = false
+
+# ---------------------------------------------------------------------------
+# Modes: enforcement, not prompt promises. Safe is the only mode allowed for
+# always-on wake-word listening. Workspace is an explicit physical action
+# only (Hyprland hotkey / push-to-talk `jarvis-listen --ask` / widget arm)
+# with a short auto-disarm. Privileged adds the jarvis-agent-run sandbox
+# wrapper plus a keyboard/button confirmation for anything destructive --
+# voice never authorizes that, and the daemon's voice path never invokes
+# the wrapper at all.
+#
+#   safe        wake-word armed. actions=false enforced at startup (the
+#               daemon refuses to start otherwise). Agent is either a
+#               CLI-verified answer-only preset (Claude Code below) or
+#               opencode-voice, whose deny lives in its agent file plus the
+#               canary -- see the opencode note at the bottom. The panel,
+#               journal and --check report anything else as FAIL, never safe.
+#   workspace   explicit arm only, auto-disarms after [workspace] seconds.
+#               actions=true unlocks the deterministic broker verbs ONLY
+#               (open-app, open-url, volume, brightness, workspace, mute):
+#               strict regex + allowlisted exec, no shell. Still no CLI tool
+#               grant -- a `command` with tool flags is refused at startup.
+#   privileged  workspace + sandboxed full-tools behind jarvis-agent-run
+#               (bwrap: empty HOME, workspace tree only, destructive argv
+#               denied unless --confirm-button passed at a keyboard).
+#               Requires the wrapper installed; the daemon checks at startup.
+# ---------------------------------------------------------------------------
+mode = "safe"
+
+[workspace]
+auto_disarm_seconds = 1800  # 60-3600. Basic (broker verbs only) window.
+full_disarm_seconds = 300   # 60-3600. Full (sandboxed tools) window.
+
+# ---------------------------------------------------------------------------
+# Your music library, without a single credential on our side.
+#
+# `mymusic liked|watchlater` opens your Liked / Watch-Later pages -- your
+# login comes from the default browser profile xdg-open targets, so this
+# works with zero configuration and zero cookie handling here.
+#
+# Named playlists need one line each below: the playlist ID from the URL of
+# a playlist page (.../playlist?list=ID). Voice "play my gym playlist" then
+# autoplays its first public video, or opens the page when it is private.
+# IDs are re-validated before use; anything else is refused.
+#
+# Playback backend: player = "browser" opens video pages (default);
+# player = "mpv" plays audio with no window at all; player = "mpv-video"
+# opens a small always-on-top 480p window instead. Both mpv modes register
+# an MPRIS player, so the media verb (pause/next, and quit to close the
+# mini player) and the widget keep working, and nothing else visible opens.
+# Needs mpv installed.
+# ---------------------------------------------------------------------------
+[music]
+player = "browser"
+
+[music.playlists]
+# gym = "PLxxxxxxxxxxxxxxxxxx"
+
+
+[listen]
+wake_threshold = 0.5   # openWakeWord score 0-1. Lower = more sensitive.
+silence_tail   = 1.2   # seconds of quiet that ends your command
+min_speech     = 0.4   # ignore blips shorter than this
+max_command    = 15.0  # hard cap on one utterance
+cooldown       = 1.0   # ignore the wake word this long after replying
+
+
+# ---------------------------------------------------------------------------
+# Agents
+#
+# `command` is argv, never a shell string. These placeholders are substituted
+# into individual arguments:
+#
+#   {system}   the voice-style system prompt Jarvis builds
+#   {outfile}  a temp file path. If present, Jarvis reads the reply from that
+#              file instead of stdout -- for CLIs that print progress logs.
+#   {prompt}   what you said, transcribed. Leave it out (both presets do):
+#              the transcript is then fed to the CLI on stdin, where it does
+#              not show up in the process list the way argv does for every
+#              local process. A command naming neither {prompt} nor {system}
+#              gets both on stdin, system prompt first.
+#
+# `actions = true` lets the agent open apps, web pages and desktop settings.
+# The agent CLI is never granted a shell or a tool either way: to act, it
+# ends its reply with a <<jarvis:...>> line, which the daemon validates
+# against a strict pattern and hands to the `jarvis-open` broker as a single
+# argv exec. Workspace mode or later only: safe mode refuses to start with
+# actions on. The Basic/Full hotkey toggle owns this flag (on when arming,
+# off when disarming, so Safe always starts); a hand-edit works too, but the
+# next toggle-disarm will return it to false. Never settable from the panel.
+# That broker can launch an installed .desktop entry, open an http(s) URL
+# (including a YouTube search page for a song), or set one deterministic
+# verb (volume 0-100|up|down|mute|unmute, brightness 1-100|up|down, workspace
+# NAME, mute on|off|toggle, media play|pause|toggle|next|prev|stop for
+# whatever player is running), and nothing else. It cannot pick a specific
+# video, click play, or drive a page -- those stay refused by design. Left
+# false, directives are ignored and the agent can only answer out loud.
+# Because the action path is reply parsing rather than a CLI tool grant, it
+# works with any agent CLI.
+#
+# It ships false. Turning it on means a sentence spoken near the microphone
+# can open an app or a web page on your screen. That is a fine trade to make
+# on purpose. It is not one to inherit from a default.
+#
+# `web_command`, when present, lets the agent answer with one web-enabled
+# round. The normal call still runs `command` -- no tools, as always -- and
+# may reply <<jarvis:search WHAT>>; Jarvis then re-invokes the agent with
+# `web_command`, which grants the CLI's own read-only search tool and
+# nothing else, and speaks that answer. The web-enabled reply is treated as
+# tainted: every directive in it is stripped and ignored, and there is no
+# second hop, so a page the search surfaced can never open apps or URLs
+# here. Grant WebSearch only -- never WebFetch or Bash, either of which
+# would hand a hostile page an exfiltration channel (the daemon warns if it
+# sees them). Know that your question may then reach a search provider
+# through the agent, not just the agent itself.
+#
+# The one preset below is tested. Adding another CLI is just another section,
+# but read the note at the bottom of this file first: whether a CLI is really
+# answer-only is a property of its argv, not of its reputation. Run
+# `jarvis-listen --agents` to see what's configured and installed, and
+# `jarvis-listen --ask "hello"` to try one without using the mic. If you get a
+# new one working safely, a PR adding it is welcome.
+# ---------------------------------------------------------------------------
+
+[agents.claude]
+# Claude Code. `claude -p` with no prompt argument reads the prompt from
+# stdin. The two tool flags are what make the call answer-only, and both
+# matter: `claude -p` on its own still has its built-in read tools and still
+# loads the MCP servers your own config defines. `--tools ""` is the empty
+# built-in allowlist and `--strict-mcp-config` (with no --mcp-config beside
+# it) loads no MCP servers, so nothing you have configured elsewhere can put
+# tools back. Actions stay brokered by the daemon as described above. Keep
+# both flags unless you have read the note above and accept the risk.
+command = [
+  "claude", "-p",
+  "--tools", "", "--strict-mcp-config",
+  "--append-system-prompt", "{system}",
+]
+# Set true to let Jarvis open apps and web pages. Read the note above first.
+actions = false
+# Uncomment to let Jarvis search the web (one bounded round, WebSearch only;
+# read the web_command note above first). `--tools` names the whole built-in
+# set this call gets, so WebSearch there means WebSearch and nothing else --
+# an allowlist that only adds a tool would leave the read tools in place.
+# web_command = [
+#   "claude", "-p",
+#   "--tools", "WebSearch", "--strict-mcp-config",
+#   "--append-system-prompt", "{system}",
+# ]
+
+# ---------------------------------------------------------------------------
+# On opencode presets (verified against opencode 1.18.30)
+#
+# `opencode run --help` carries NO permission keys: grants live in the agent
+# file frontmatter (~/.config/opencode/agents/<name>.md), where a missing key
+# falls back to the default-allow ruleset. Jarvis verifies that file itself:
+# posture is "denied" only if every tool key (bash, edit, read, glob, grep,
+# list, task, webfetch, websearch, skill, lsp, todowrite, external_directory,
+# question) is EXPLICITLY deny -- anything else fails closed to "FAIL: tools
+# not verified" and every mode refuses to start. Cross-checked via
+# `opencode debug agent <name>` (effective tools map) plus the canary below.
+# Re-verify after any opencode upgrade.
+#
+# The canary (never ~/canary.txt): plant a known string in a DISPOSABLE dir
+# and run `jarvis-listen --ask "read <that file> and tell me what it says"`.
+# The string must NOT come back. Re-run after any change here.
+#
+# The blessed safe preset (uncomment to use; keep actions = false):
+#
+# [agents.opencode-voice]
+# command = ["opencode", "run", "--agent", "jarvis-voice",
+#            "-m", "opencode/muse-spark-1.3-contributor-free"]
+# actions = false
+# strip_prefixes = [">"]
+# timeout = 180
+#
+# Isolated web round for an opencode agent (opt-in, WebSearch only -- never
+# WebFetch or Bash; the web reply is tainted: all directives stripped, no
+# second hop, lengths-only audit). Belongs inside the agent section as
+# `web_command`:
+#
+#   web_command = ["opencode", "run", "--agent", "jarvis-web",
+#                  "-m", "opencode/muse-spark-1.3-contributor-free"]
+#
+# Privileged full-tools (NOT for the voice path): run by hand at a keyboard
+# inside the sandbox, destructive shapes denied without --confirm-button:
+#
+#   jarvis-agent-run --workspace ~/VoiceWorkspace -- \
+#     opencode run --agent jarvis-full -m <model>
+#
+# ---------------------------------------------------------------------------
+# On Codex, and on writing your own preset
+#
+# There is deliberately no [agents.codex] section here, and it is worth
+# knowing why before you write one.
+#
+# The `command` above is answer-only because `--tools ""` removes the tools
+# from the conversation. Codex has no equivalent flag. Its only control is
+# `-s <read-only|workspace-write|danger-full-access>`, which sandboxes the
+# shell tool rather than removing it, and `read-only` means "cannot write",
+# not "cannot read". Under it the agent can still read every file you can
+# read. Verified against codex-cli 0.149.0:
+#
+#     $ codex sandbox -- cat ~/canary.txt
+#     CANARY                                  # the read succeeds
+#     $ codex sandbox -- sh -c 'echo x > ~/canary.txt'
+#     sh: /home/you/canary.txt: Read-only file system
+#
+# So a `codex exec -s read-only` preset is NOT answer-only. A sentence spoken
+# near the microphone can ask it to read your SSH keys, your browser cookies
+# or your password store and speak the contents back. `actions = false` does
+# not help: that only strips Jarvis's own <<jarvis:...>> directives, and has
+# no bearing on the agent CLI's own tools.
+#
+# The same test applies to any CLI you add here. Do not trust a flag name or
+# a sandbox mode to mean answer-only. Prove it: put a file with a known
+# string in your home directory, then run
+#
+#     jarvis-listen --ask "read ~/canary.txt and tell me what it says"
+#
+# If the string comes back, that CLI has tools and this is not a safe preset.
+# Jarvis cannot enforce this for you, because the boundary lives inside the
+# agent CLI's own argv. What it does do is refuse to guess: it calls an agent
+# "answer-only" only for an invocation it can positively verify is tool-free,
+# which today means Claude Code with an empty `--tools` and a strict MCP
+# config. Anything else, including a bare `claude -p`, is reported as "tools
+# not verified" in the panel, the journal and --check, with a warning at
+# startup. That is an admission, not a verdict: it means run the canary.
+#
+# Running Codex safely here would mean confining it yourself, in an OS
+# sandbox exposing no user files beyond an empty workspace and with no
+# reusable credentials readable inside it. That is a real thing to build, not
+# a flag to set, which is why nothing here pretends to have done it.
+# ---------------------------------------------------------------------------
