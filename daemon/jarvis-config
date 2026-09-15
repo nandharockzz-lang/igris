@@ -47,6 +47,8 @@ WRITABLE = {
     "mode":                   "str",
     "wake_word":              "str",
     "voice":                  "str",
+    "model":                  "str",  # Top-level model setting for OpenCode agent
+    "draggable_avatar_enabled": "bool",
     "listen.wake_threshold":  "float",
     "listen.silence_tail":    "float",
     "listen.min_speech":      "float",
@@ -75,6 +77,10 @@ def coerce(key, raw):
             return float(raw)
         except ValueError:
             raise SystemExit(f"{key} must be a number, got {raw!r}")
+    if kind == "bool":
+        if raw.lower() in ("true", "false"):
+            return raw.lower() == "true"
+        raise SystemExit(f"{key} must be true or false, got {raw!r}")
     if CONTROL_CHARS.search(raw):
         raise SystemExit(f"{key} may not contain control characters")
     return raw
@@ -121,6 +127,18 @@ def validate(daemon, key, value, config_path):
         path = value if os.path.isabs(value) else os.path.join(voices_dir(), value)
         if not os.path.exists(path):
             raise SystemExit(f"no such voice file: {path}")
+    if key == "model":
+        # Validate that the model is available in OpenCode
+        if not value:
+            raise SystemExit("model setting cannot be empty")
+        available = get_available_models()
+        model_ids = [m["id"] for m in available]
+        if value not in model_ids:
+            # Show available models in error message
+            available_list = ", ".join(model_ids[:5])  # Show first 5
+            if len(model_ids) > 5:
+                available_list += f" (and {len(model_ids) - 5} more)"
+            raise SystemExit(f"model '{value}' not available. Available: {available_list}")
     if key == "listen.wake_threshold" and not 0.0 < value <= 1.0:
         raise SystemExit("wake_threshold must be between 0 and 1")
     if key == "workspace.auto_disarm_seconds" and not 60 <= value <= 3600:
@@ -129,6 +147,8 @@ def validate(daemon, key, value, config_path):
         raise SystemExit("workspace.full_disarm_seconds must be 60-3600")
     if key.startswith("listen.") and key != "listen.wake_threshold" and value <= 0:
         raise SystemExit(f"{key} must be positive")
+    if key == "draggable_avatar_enabled" and not isinstance(value, bool):
+        raise SystemExit("draggable_avatar_enabled must be true or false")
 
 
 def format_value(value):
@@ -331,10 +351,12 @@ def cmd_show(daemon, args):
         "workspace": workspace,
         "wake_word": cfg.get("wake_word"),
         "voice": cfg.get("voice"),
+        "model": cfg.get("model", ""),  # Add top-level model setting
         "listen": listen,
         "agents": agents,
         "wake_words": list(daemon.WAKE_WORDS),
         "voices": voice_list(),
+        "available_models": get_available_models(),  # Add available OpenCode models
     }, indent=2))
     return 0
 
@@ -343,12 +365,120 @@ def voice_list():
     """Every voice the panel may offer: what is on disk, plus the catalog."""
     on_disk = installed_voices()
     out = [{"id": os.path.splitext(f)[0], "file": f, "installed": True}
-           for f in on_disk]
+            for f in on_disk]
     known = {v["id"] for v in out}
     for vid in VOICE_CATALOG:
         if vid not in known:
             out.append({"id": vid, "file": vid + ".onnx", "installed": False})
     return out
+
+
+def opencode_models_list():
+    """Get available OpenCode models by running 'opencode models' command."""
+    try:
+        import subprocess
+        import json
+        
+        # Run opencode models command
+        proc = subprocess.run(
+            ["opencode", "models", "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if proc.returncode != 0:
+            # Fallback to basic list if JSON format not supported
+            proc = subprocess.run(
+                ["opencode", "models"],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if proc.returncode == 0:
+                # Parse simple list format (one model per line)
+                models = []
+                for line in proc.stdout.strip().split('\n'):
+                    if line.strip():
+                        models.append({"id": line.strip(), "name": line.strip()})
+                return models
+            else:
+                return []
+        
+        # Parse JSON output
+        try:
+            data = json.loads(proc.stdout)
+            models = []
+            if isinstance(data, list):
+                for model in data:
+                    if isinstance(model, str):
+                        models.append({"id": model, "name": model})
+                    elif isinstance(model, dict) and "id" in model:
+                        models.append({
+                            "id": model["id"],
+                            "name": model.get("name", model["id"])
+                        })
+            elif isinstance(data, dict) and "models" in data:
+                for model in data["models"]:
+                    if isinstance(model, str):
+                        models.append({"id": model, "name": model})
+                    elif isinstance(model, dict) and "id" in model:
+                        models.append({
+                            "id": model["id"],
+                            "name": model.get("name", model["id"])
+                        })
+            return models
+        except (json.JSONDecodeError, KeyError):
+            # If JSON parsing fails, return empty list
+            return []
+            
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        # opencode not available or timeout
+        return []
+
+
+# Cache for OpenCode models to avoid frequent calls
+_opencode_models_cache = {"timestamp": 0, "models": []}
+MODEL_CACHE_DURATION = 3600  # 1 hour in seconds
+
+
+def get_available_models(force_refresh=False):
+    """Get available OpenCode models with caching."""
+    import time
+    
+    now = time.time()
+    if not force_refresh and now - _opencode_models_cache["timestamp"] < MODEL_CACHE_DURATION:
+        return _opencode_models_cache["models"]
+    
+    # Refresh cache
+    models = opencode_models_list()
+    _opencode_models_cache["timestamp"] = now
+    _opencode_models_cache["models"] = models
+    return models
+
+
+def cmd_models(daemon, args):
+    """List available OpenCode models."""
+    provider = args.provider if hasattr(args, 'provider') and args.provider else None
+    
+    if provider and provider != "opencode":
+        print(f"Error: Only 'opencode' provider is supported")
+        return 1
+    
+    models = get_available_models()
+    
+    if not models:
+        print("No OpenCode models available or opencode not installed")
+        return 1
+    
+    if hasattr(args, 'format') and args.format == "json":
+        print(json.dumps(models, indent=2))
+    else:
+        # Simple list format
+        for model in models:
+            print(model["id"])
+    
+    return 0
 
 
 # A piper medium voice is ~63MB and its metadata a few KB. Both ceilings are
@@ -484,6 +614,10 @@ def main():
     setp.add_argument("value")
     iv = sub.add_parser("install-voice", help="download a piper voice")
     iv.add_argument("voice")
+    # Add models command
+    mpc = sub.add_parser("models", help="list available OpenCode models")
+    mpc.add_argument("provider", nargs="?", help="provider name (only 'opencode' supported)")
+    mpc.add_argument("--format", choices=["json", "text"], default="text", help="output format")
 
     args = parser.parse_args()
     daemon = load_daemon()
@@ -491,6 +625,7 @@ def main():
         "show": cmd_show,
         "set": cmd_set,
         "install-voice": cmd_install_voice,
+        "models": cmd_models,
     }[args.cmd](daemon, args)
 
 

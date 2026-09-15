@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""Physical toggle between the user-facing Basic and Full modes.
+
+SUPER+SHIFT+J runs this with no arguments: stopped -> Basic -> Full ->
+stopped. Panic stays separate (`jarvis-rollback --panic`).
+
+UI mapping (internal daemon modes preserved):
+  Basic  = workspace: broker verbs only, longer auto-disarm window
+  Full   = privileged: sandboxed full-tools agent, short window, visible
+           countdown; destructive ops still need keyboard/button approval
+
+The daemon owns the mode state. This script only REQUESTS transitions: it
+writes `mode` through `jarvis-config set` (which reuses daemon validation)
+and starts/stops/restarts the unit. If the daemon refuses (bad combination),
+the unit never becomes active and this reports the failure instead of
+pretending -- there is no path here that bypasses daemon checks. It never
+touches anything under [agents.*] (no argv, no actions flag); lighting up
+broker verbs remains a deliberate hand-edit (see the hint below).
+
+Usage:
+    jarvis-toggle [--unit NAME] [--config PATH] [--state-dir DIR] [--status]
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import safefile  # noqa: E402  (needs our own directory on the path first)
+
+HOME = os.path.expanduser("~")
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+DEFAULT_CONFIG = os.path.join(CONFIG_HOME, "jarvis", "config.toml")
+VOICES_DIR = os.path.join(HOME, ".local", "share", "jarvis", "voices")
+
+
+def _own_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_helper(name):
+    """Locate a sibling helper, deployed (bin/) or repo (flat daemon/) layout."""
+    here = _own_dir()
+    for candidate in (os.path.join(here, name),
+                      os.path.join(here, "..", "bin", name),
+                      os.path.join(HOME, ".local", "share", "jarvis",
+                                   "bin", name),
+                      os.path.join(HOME, ".local", "share", "jarvis", name)):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def default_state_dir():
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = runtime or os.environ.get("XDG_STATE_HOME") \
+        or os.path.join(HOME, ".local", "state")
+    return os.path.join(base, "jarvis")
+
+
+def _run(argv, timeout=30):
+    """Subprocess seam (tests replace this; never a shell)."""
+    return subprocess.run(argv, capture_output=True, timeout=timeout,
+                          text=True)
+
+
+def notify(title, body):
+    try:
+        subprocess.run(["notify-send", "-a", "Jarvis", title, body],
+                       capture_output=True, timeout=5)
+    except OSError:
+        pass
+
+
+def fail_note(message):
+    print(f"jarvis-toggle: {message}", file=sys.stderr)
+    notify("Jarvis toggle failed", message)
+
+
+def read_top_key(config_path, key, default):
+    """One top-level `key = "value"` (or number) from TOML without parsing
+    agent sections. Returns default when absent."""
+    try:
+        with open(config_path) as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith("["):
+                    break  # tables begin: top level is over
+                if stripped.startswith(key + " =") or \
+                        stripped.startswith(key + "="):
+                    _, _, value = line.partition("=")
+                    value = value.split("#", 1)[0].strip().strip("\"'")
+                    return value or default
+    except OSError:
+        pass
+    return default
+
+
+def read_section_key(config_path, section, key, default):
+    """One `key = value` inside a [section]."""
+    import re
+    current = ""
+    try:
+        with open(config_path) as fh:
+            for line in fh:
+                match = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+                if match:
+                    current = match.group(1).strip()
+                    continue
+                if current == section:
+                    stripped = line.strip()
+                    if stripped.startswith(key + " =") or \
+                            stripped.startswith(key + "="):
+                        _, _, value = line.partition("=")
+                        return value.split("#", 1)[0].strip() or default
+    except OSError:
+        pass
+    return default
+
+
+def set_actions(config_path, agent, want):
+    """Set `actions` inside [agents.<agent>] ONLY. This is the one writer
+    besides a hand-edit: the toggle is a physical act (hotkey/click), so it
+    may own this flag the way a hand-edit does. The panel/QML path can never
+    reach this function (jarvis-config refuses all of [agents.*]) and voice
+    has no code path here at all. Atomic, comments preserved. Returns an
+    error string, or None on success."""
+    import re
+    want_text = "true" if want else "false"
+    try:
+        lines = safefile.read_text(
+            config_path, safefile.MAX_CONFIG_BYTES).splitlines()
+    except OSError as exc:
+        return f"cannot read config ({exc})"
+    section = f"agents.{agent}"
+    current, found_section, done = "", False, False
+    key_re = re.compile(r"^(\s*)actions(\s*)=", re.ASCII)
+    for i, line in enumerate(lines):
+        match = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+        if match:
+            current = match.group(1).strip()
+            found_section = found_section or current == section
+            continue
+        if current == section and key_re.match(line):
+            value = line.split("#", 1)[0]
+            if ("true" in value) == want:
+                return None  # already what we want: touch nothing
+            lines[i] = f"{key_re.match(line).group(1)}actions = {want_text}"
+            done = True
+            break
+    if not found_section:
+        return f"no [{section}] section in config; refusing to invent one"
+    if not done:
+        return f"no actions key in [{section}]; refusing to invent one"
+    try:
+        safefile.write_atomic(
+            config_path, "\n".join(lines).rstrip("\n") + "\n")
+    except OSError as exc:
+        return f"cannot write config ({exc})"
+    return None
+
+
+def read_state(state_dir, unit):
+    """Authoritative runtime state: unit liveness + daemon-published files."""
+    try:
+        running = _run(["systemctl", "--user", "is-active", unit],
+                       timeout=10).stdout.strip() == "active"
+    except (OSError, subprocess.TimeoutExpired):
+        running = False
+    mode, deadline = "safe", None
+    for name in ("mode", "armed_until"):
+        try:
+            with open(os.path.join(state_dir, name)) as fh:
+                value = fh.read(64).strip()
+        except OSError:
+            continue
+        if name == "mode" and value in ("safe", "workspace", "privileged"):
+            mode = value
+        if name == "armed_until":
+            try:
+                deadline = float(value)
+            except ValueError:
+                pass
+    live = running and (mode == "safe"
+                        or (deadline is not None and deadline > time.time()))
+    return {"running": running, "mode": mode, "deadline": deadline,
+            "live": live}
+
+
+def set_mode(config_bin, config_path, mode):
+    """Request a mode through jarvis-config (daemon validation applies)."""
+    try:
+        proc = _run([config_bin, "--config", config_path,
+                     "set", "mode", mode], timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not run jarvis-config ({exc})"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        detail = [l for l in detail if not l.startswith("[jarvis] config")]
+        return detail[-1][:200] if detail else "jarvis-config refused"
+    return None
+
+
+def control_unit(unit, action, wait_active=None, timeout=8):
+    try:
+        proc = _run(["systemctl", "--user", action, unit], timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"systemctl {action} failed ({exc})"
+    if proc.returncode != 0:
+        return f"systemctl {action} failed " \
+            f"({(proc.stderr or proc.stdout).strip()[:160]})"
+    if wait_active is not None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if read_state(default_state_dir(), unit)["running"] == wait_active:
+                return None
+            time.sleep(0.3)
+        want = "active" if wait_active else "inactive"
+        return (f"unit did not become {want} -- the daemon likely refused "
+                "the mode (see journalctl --user -u jarvis)")
+    return None
+
+
+def clear_arm(state_dir):
+    for name in ("armed_until",):
+        try:
+            os.unlink(os.path.join(state_dir, name))
+        except OSError:
+            pass
+
+
+def announce(text, config_path):
+    """Voice confirmation for Full mode. Best-effort: any failure is silent
+    (the notification already confirmed the transition). Never blocks long."""
+    try:
+        voice = read_top_key(config_path, "voice", "en_US-amy-medium.onnx")
+        voice_path = voice if os.path.isabs(voice) else os.path.join(
+            VOICES_DIR, voice)
+        venv_py = os.path.join(HOME, ".local", "share", "jarvis", "venv",
+                               "bin", "python")
+        if not (os.path.exists(voice_path) and os.access(venv_py, os.X_OK)):
+            return
+        with tempfile.NamedTemporaryFile(suffix=".wav",
+                                         delete=False) as tmp:
+            out = tmp.name
+        try:
+            synth = _run([venv_py, "-m", "piper", "-m", voice_path,
+                          "-f", out], timeout=25)
+            if synth.returncode != 0 or os.path.getsize(out) <= 44:
+                return
+            _run(["pw-play", out], timeout=20)
+        finally:
+            try:
+                os.unlink(out)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def fmt_remaining(deadline):
+    secs = max(0, int(deadline - time.time()))
+    return f"{secs // 60}:{secs % 60:02d}"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="jarvis-toggle")
+    parser.add_argument("--unit", default="jarvis")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--state-dir", default=None)
+    parser.add_argument("--status", action="store_true")
+    args = parser.parse_args(argv)
+
+    state_dir = args.state_dir or default_state_dir()
+    state = read_state(state_dir, args.unit) if not args.status else None
+    if args.status:
+        live = read_state(state_dir, args.unit)
+        print(json.dumps({
+            "running": live["running"], "mode": live["mode"],
+            "live": live["live"],
+            "remaining": (fmt_remaining(live["deadline"])
+                          if live["deadline"] else None),
+        }, indent=2))
+        return 0
+
+    config_bin = find_helper("jarvis-config")
+    if config_bin is None:
+        fail_note("jarvis-config not found; reinstall the plugin")
+        return 1
+
+    # Full and live -> second press disarms (stops new tool calls; tracked
+    # human-confirmed runs are panic's job, not the toggle's). Disarm also
+    # returns the actions flag so a later Safe arm can never refuse startup.
+    if state["running"] and state["mode"] == "privileged" and state["live"]:
+        err = control_unit(args.unit, "stop", wait_active=False)
+        clear_arm(state_dir)
+        if err:
+            fail_note(err)
+            return 1
+        agent = read_top_key(args.config, "agent", "opencode-voice")
+        err = set_actions(args.config, agent, False)
+        if err:
+            fail_note(f"disarmed, but {err}")
+            return 1
+        notify("Jarvis", "Full mode disarmed")
+        print("disarmed Full mode")
+        return 0
+
+    # Basic and live -> step up to Full.
+    if state["running"] and state["mode"] == "workspace" and state["live"]:
+        wrapper = find_helper("jarvis-agent-run")
+        if wrapper is None:
+            fail_note("privileged mode needs jarvis-agent-run installed")
+            return 1
+        err = set_mode(config_bin, args.config, "privileged")
+        if err:
+            fail_note(err)
+            return 1
+        agent = read_top_key(args.config, "agent", "opencode-voice")
+        err = set_actions(args.config, agent, True)
+        if err:
+            set_mode(config_bin, args.config, "workspace")
+            fail_note(err)
+            return 1
+        err = control_unit(args.unit, "restart", wait_active=True)
+        if err:
+            fail_note(err)
+            return 1
+        notify("Jarvis", "Full mode armed -- destructive actions still "
+               "need keyboard or button confirmation")
+        print("armed Full mode")
+        announce("Full mode armed.", args.config)
+        return 0
+
+    # Stopped, expired, or safe -> arm Basic: workspace mode plus the broker
+    # verbs flag, so commands work the moment it arms. The daemon validates
+    # the combination at startup; a refusal aborts before arming.
+    prev_mode = read_top_key(args.config, "mode", "safe")
+    err = set_mode(config_bin, args.config, "workspace")
+    if err:
+        fail_note(err)
+        return 1
+    agent = read_top_key(args.config, "agent", "opencode-voice")
+    err = set_actions(args.config, agent, True)
+    if err:
+        set_mode(config_bin, args.config, prev_mode)
+        fail_note(err)
+        return 1
+    action = "restart" if state["running"] else "start"
+    err = control_unit(args.unit, action, wait_active=True)
+    if err:
+        fail_note(err)
+        return 1
+    notify("Jarvis", "Basic armed: volume, apps, workspaces and more "
+           "by voice")
+    print("armed Basic mode")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -52,16 +52,18 @@ Panel {
   property string mode: "safe"
   property var modes: []
   property real autoDisarm: 300
-  property string wakeWord: ""
-  property var agents: []
-  property var wakeWords: []
-  property real wakeThreshold: 0.5
-  property real silenceTail: 1.2
-  property real maxCommand: 15.0
-  property var voices: []
-  property string voice: ""
-  property bool loaded: false
-  property string errorText: ""
+property string wakeWord: ""
+   property var agents: []
+   property var wakeWords: []
+   property var voices: []
+   property var availableModels: []  // Available OpenCode models
+   property real wakeThreshold: 0.5
+   property real silenceTail: 1.2
+   property real maxCommand: 15.0
+   property string voice: ""
+   property string model: ""  // Top-level model setting for OpenCode agent
+   property bool loaded: false
+   property string errorText: ""
 
   // A voice is ~63MB, so selecting one that is not on disk yet downloads it
   // first. The dropdown locks while that runs.
@@ -175,8 +177,8 @@ Panel {
 
   Process {
     id: showProc
-    command: [root.helper, "show"]
-    stdout: StdioCollector {
+command: [root.helper, "show"]
+   stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         try {
@@ -185,6 +187,8 @@ Panel {
           root.mode = d.mode || "safe"
           root.modes = d.modes || []
           root.wakeWord = d.wake_word || ""
+          root.model = d.model || ""  // Load the model setting
+          root.availableModels = d.available_models || []  // Load available models
           root.agents = d.agents || []
           root.wakeWords = d.wake_words || []
           root.voices = d.voices || []
@@ -634,18 +638,60 @@ Panel {
             }
 
             Text {
-              text: root.installingVoice
-                ? "Downloading " + root.pendingVoice + "… about 63 MB."
-                : "Voices not listed here work too. Put a path in the config file."
-              color: Qt.darker(root.fg, 1.4)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-              width: parent.width
-            }
-          }
+text: root.installingVoice
+                   ? "Downloading " + root.pendingVoice + "… about 63 MB."
+                   : "Voices not listed here work too. Put a path in the config file."
+               color: Qt.darker(root.fg, 1.4)
+               font.family: root.fontFamily
+               font.pixelSize: Style.font.caption
+               wrapMode: Text.WordWrap
+               width: parent.width
+             }
+           }
 
-          PanelSeparator { foreground: root.fg }
+           // Model dropdown - only shown for OpenCode agent
+           Column {
+             width: parent.width
+             spacing: Style.space(4)
+
+Dropdown {
+                width: parent.width
+                label: "Model"
+                value: root.model
+                enabled: root.loaded && root.agent === "opencode-voice"
+                foreground: root.fg
+                accent: root.accent
+                fontFamily: root.fontFamily
+                options: {
+                  var out = []
+                  for (var i = 0; i < root.availableModels.length; i++) {
+                    var model = root.availableModels[i]
+                    // model is an object with id and name
+                    var displayName = model.name.replace(/-/g, " ")
+                    out.push({
+                      value: model.id,
+                      label: displayName
+                    })
+                  }
+                  return out
+                }
+                onChanged: function(v) { if (v !== root.model) root.apply("model", v) }
+              }
+
+             Text {
+               text: root.agent === "opencode-voice"
+                     ? "Select the OpenCode model to use. Switch to a different free model when the current one is exhausted."
+                     : "Model selection is only available for the OpenCode agent."
+               visible: text !== ""
+               color: Qt.darker(root.fg, 1.4)
+               font.family: root.fontFamily
+               font.pixelSize: Style.font.caption
+               wrapMode: Text.WordWrap
+               width: parent.width
+             }
+           }
+
+           PanelSeparator { foreground: root.fg }
 
           // --------------------------------------------------------- listening
           PanelSectionHeader {

@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""The narrow broker behind the voice assistant's actions.
+
+The agent CLI is never granted a shell or a tool. When actions are enabled
+(workspace mode or later only -- safe mode never acts), the daemon parses one
+strictly validated <<jarvis:...>> directive out of the agent's reply text and
+execs this script directly -- a single argv, no shell anywhere in the path.
+That makes this script the entire blast radius: it can launch an installed
+desktop app, open an http(s) URL, or set one deterministic desktop verb
+(volume, brightness, workspace, mute), and nothing else, and it re-validates
+its arguments itself rather than trusting the caller's.
+
+    jarvis-open list                 every launchable app name
+    jarvis-open app <name>           launch one
+    jarvis-open url <https://…>      open a web page
+    jarvis-open volume <0-100|up|down|mute|unmute>
+    jarvis-open brightness <1-100|up|down>
+    jarvis-open workspace <name>     switch Hyprland workspace
+    jarvis-open mute <on|off|toggle|mute|unmute>
+    jarvis-open media <play|pause|toggle|next|prev|stop>
+        transport keys for whichever media player is running (browser,
+        music app) via MPRIS. Deterministic keys only: it can pause,
+        resume or skip -- never pick content or touch a page.
+    jarvis-open music <words>        open the top YouTube result for words
+        (yt-dlp ytsearch1, no API key). The query is validated here, the
+        resolved URL is re-validated to a youtube watch link before it is
+        opened, and only the query length is ever logged.
+
+Every verb below execs an allowlisted argv directly (wpctl / brightnessctl /
+hyprctl / gdbus) with a timeout. No shell sits anywhere in that path.
+
+It used to be a shell script that ran `grep` over every path matching
+$HOME/.local/share/applications/*.desktop and buffered the whole generated
+entry list. Both halves of that trusted the filesystem: a `.desktop` name
+planted as a FIFO makes grep wait for a writer that never comes -- hanging
+the agent call, and with it the assistant -- and a large or endless file is
+read into memory whole. Reading is done here instead, descriptor-first
+through safefile: never blocking, regular files only, bounded per file and
+bounded in total.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import safefile  # noqa: E402  (needs our own directory on the path first)
+
+HOME = os.path.expanduser("~")
+DATA_HOME = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+APP_DIRS = [os.path.join(DATA_HOME, "applications"), "/usr/share/applications"]
+
+# A .desktop entry is a small ini file; the largest on a normal system is a
+# few KB. 64 KiB is room to spare, and everything past it is not an entry we
+# need to read to answer "what apps are installed".
+MAX_ENTRY_BYTES = 64 << 10
+# Nothing to do with what a desktop looks like -- a ceiling so a directory
+# stuffed with files cannot make this process grow without bound.
+MAX_ENTRIES = 4000
+
+# /usr/share/applications is root-owned and ~/.local/share/applications is
+# ours. Anything owned by a third uid is not a package's entry or one we
+# wrote, so it does not get read.
+OWNERS = {os.geteuid(), 0}
+
+NAME_RE = re.compile(r"^Name\s*=\s*(.*)$")
+NODISPLAY_RE = re.compile(r"^NoDisplay\s*=\s*(.*)$")
+URL_RE = re.compile(r"^https?://[^\s\"'\\<>]+$")
+
+
+def read_entry(path):
+    """(name, hidden) for one .desktop file, or None if it is unreadable.
+
+    A symlinked .desktop is a normal thing to have, so those are followed --
+    but the descriptor still has to turn out to be a regular file of an
+    expected owner, within the size ceiling, and the open never blocks.
+    """
+    try:
+        text = safefile.read_text(path, MAX_ENTRY_BYTES,
+                                  allow_symlink=True, owners=OWNERS)
+    except (OSError, ValueError):
+        return None
+
+    name = hidden = None
+    for line in text.splitlines():
+        if name is None:
+            match = NAME_RE.match(line)
+            if match:
+                name = match.group(1).strip()
+                continue
+        if hidden is None:
+            match = NODISPLAY_RE.match(line)
+            if match:
+                hidden = match.group(1).strip().lower() == "true"
+        if name is not None and hidden is not None:
+            break
+    return name, bool(hidden)
+
+
+def entries():
+    """Every installed .desktop entry as (id, name), minus the hidden ones.
+
+    First directory wins on a duplicate id, so a user's own override of a
+    packaged entry is the one that shows up.
+    """
+    found = {}
+    for directory in APP_DIRS:
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for filename in names:
+            if not filename.endswith(".desktop"):
+                continue
+            entry_id = filename[: -len(".desktop")]
+            if entry_id in found:
+                continue
+            # An entry named "--version.desktop" would reach gtk-launch as an
+            # option rather than an app. Nothing legitimate is named this way.
+            if entry_id.startswith("-"):
+                continue
+            if len(found) >= MAX_ENTRIES:
+                return sorted(found.items())
+            parsed = read_entry(os.path.join(directory, filename))
+            if parsed is None:
+                continue
+            name, hidden = parsed
+            if hidden:
+                continue
+            found[entry_id] = name or entry_id
+    return sorted(found.items())
+
+
+def resolve(query):
+    """Exact id, then exact name, then substring on either. First hit wins."""
+    query = query.lower()
+    all_entries = entries()
+    for entry_id, name in all_entries:
+        if query in (entry_id.lower(), name.lower()):
+            return entry_id
+    for entry_id, name in all_entries:
+        if query in entry_id.lower() or query in name.lower():
+            return entry_id
+    return None
+
+
+def spawn(argv):
+    """Detach, so the app outlives this script and the daemon's timeout."""
+    subprocess.Popen(argv, start_new_session=True,
+                     stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+
+
+def have(command):
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if directory and os.access(os.path.join(directory, command), os.X_OK):
+            return True
+    return False
+
+
+def launch(entry_id):
+    desktop = entry_id + ".desktop"
+    # Under uwsm the app belongs in its own systemd scope; elsewhere
+    # gtk-launch is what actually knows how to run a .desktop entry.
+    if have("uwsm") and os.environ.get("UWSM_WAIT_VARNAMES"):
+        spawn(["uwsm", "app", "--", desktop])
+    elif have("gtk-launch"):
+        spawn(["gtk-launch", "--", desktop])
+    else:
+        raise SystemExit("no way to launch a .desktop entry "
+                         "(install uwsm or gtk-launch)")
+
+
+def usage():
+    print("usage: jarvis-open list | app <name> | url <https://...> | "
+          "volume <0-100|up|down|mute|unmute> | brightness <1-100|up|down> | "
+          "workspace <name> | mute <on|off|toggle|mute|unmute> | "
+          "media <play|pause|toggle|next|prev|stop|quit> | music <words> | "
+          "mymusic <liked|watchlater|playlist NAME>",
+          file=sys.stderr)
+    return 2
+
+
+VOLUME_RE = re.compile(r"^(\d{1,3}|up|down|mute|unmute)$")
+BRIGHTNESS_RE = re.compile(r"^(\d{1,3}|up|down)$")
+WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,31}$")
+MUTE_RE = re.compile(r"^(on|off|toggle|mute|unmute)$")
+MEDIA_RE = re.compile(r"^(play|pause|toggle|next|prev|stop|quit)$")
+MEDIA_METHOD = {"play": "Play", "pause": "Pause", "toggle": "PlayPause",
+                "next": "Next", "prev": "Previous", "stop": "Stop"}
+MUSIC_QUERY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 +.'\-]{0,79}$")
+WATCH_RE = re.compile(r"^https://www\.youtube\.com/watch\?v=[A-Za-z0-9_-]{11}(&autoplay=1)?$")
+WATCH_LIST_RE = re.compile(
+    r"^https://www\.youtube\.com/watch\?v=[A-Za-z0-9_-]{11}"
+    r"&list=[A-Za-z0-9_-]{10,64}(&autoplay=1)?$")
+PLAYLIST_PAGE_RE = re.compile(
+    r"^https://www\.youtube\.com/playlist\?list=[A-Za-z0-9_-]{2,64}$")
+PLAYLIST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,64}$")
+MYMUSIC_RE = re.compile(
+    r"^(liked|favourites|favorites|watchlater|watch later"
+    r"|playlist [A-Za-z0-9 _.'\-]{1,40})$")
+
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+CONFIG_PATH = os.path.join(CONFIG_HOME, "jarvis", "config.toml")
+
+
+def run_cmd(argv, timeout=10):
+    """Run one allowlisted argv, no shell, bounded. Returns (rc, output)."""
+    try:
+        proc = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=timeout,
+                              check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"backend failed: {exc}", file=sys.stderr)
+        return 1, ""
+    out = (proc.stdout or b"").decode("utf-8", "replace").strip()[:500]
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip()[:200]
+        print(f"backend refused: {err or out or proc.returncode}",
+              file=sys.stderr)
+        return proc.returncode or 1, ""
+    return 0, out
+
+
+def cmd_volume(value):
+    if not VOLUME_RE.match(value):
+        print("refusing bad volume value", file=sys.stderr)
+        return 1
+    if value.isdigit():
+        pct = int(value)
+        if not 0 <= pct <= 100:
+            print("refusing out-of-range volume", file=sys.stderr)
+            return 1
+        rc, _ = run_cmd(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@",
+                         f"{pct}%"])
+        if rc == 0:
+            print(f"volume {pct}%")
+        return rc
+    if value in ("mute",):
+        rc, _ = run_cmd(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1"])
+        if rc == 0:
+            print("muted")
+        return rc
+    if value in ("unmute",):
+        rc, _ = run_cmd(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"])
+        if rc == 0:
+            print("unmuted")
+        return rc
+    if value == "up":
+        rc, _ = run_cmd(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@",
+                         "5%+"])
+        if rc == 0:
+            print("volume up")
+        return rc
+    if value == "down":
+        rc, _ = run_cmd(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@",
+                         "5%-"])
+        if rc == 0:
+            print("volume down")
+        return rc
+    print("refusing bad volume value", file=sys.stderr)
+    return 1
+
+
+def cmd_brightness(value):
+    if not BRIGHTNESS_RE.match(value):
+        print("refusing bad brightness value", file=sys.stderr)
+        return 1
+    if value.isdigit():
+        pct = int(value)
+        if not 1 <= pct <= 100:
+            print("refusing out-of-range brightness", file=sys.stderr)
+            return 1
+        rc, _ = run_cmd(["brightnessctl", "set", f"{pct}%"])
+        if rc == 0:
+            print(f"brightness {pct}%")
+        return rc
+    if value == "up":
+        rc, _ = run_cmd(["brightnessctl", "set", "+5%"])
+        if rc == 0:
+            print("brightness up")
+        return rc
+    rc, _ = run_cmd(["brightnessctl", "set", "5%-"])
+    if rc == 0:
+        print("brightness down")
+    return rc
+
+
+def cmd_workspace(value):
+    if not WORKSPACE_RE.match(value):
+        print("refusing bad workspace name", file=sys.stderr)
+        return 1
+    rc, _ = run_cmd(["hyprctl", "dispatch", "workspace", value])
+    if rc == 0:
+        print(f"workspace {value}")
+    return rc
+
+
+def cmd_mute(value):
+    if not MUTE_RE.match(value):
+        print("refusing bad mute value", file=sys.stderr)
+        return 1
+    want = {"on": "1", "mute": "1", "off": "0", "unmute": "0"}.get(value)
+    if want is None:  # toggle
+        rc, _ = run_cmd(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@",
+                         "toggle"])
+        if rc == 0:
+            print("mute toggled")
+        return rc
+    rc, _ = run_cmd(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", want])
+    if rc == 0:
+        print("muted" if want == "1" else "unmuted")
+    return rc
+
+
+def mpris_players():
+    """Sorted MPRIS player bus names (browsers, music apps), or []."""
+    try:
+        proc = subprocess.run(
+            ["busctl", "--user", "list", "--no-legend"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    players = []
+    for line in (proc.stdout or b"").decode("utf-8", "replace").splitlines():
+        name = line.split()[0] if line.split() else ""
+        if name.startswith("org.mpris.MediaPlayer2."):
+            players.append(name)
+    return sorted(players)
+
+
+def cmd_media(value):
+    if not MEDIA_RE.match(value):
+        print("refusing bad media value", file=sys.stderr)
+        return 1
+    players = mpris_players()
+    if not players:
+        print("no media players running", file=sys.stderr)
+        return 1
+    if value == "quit":
+        # Quit closes a player outright, so it is scoped to the mpv mini
+        # player only: quitting whatever happens to be first (a browser!)
+        # would nuke the user's session. No mpv, no quit.
+        mpvs = [p for p in players if ".mpv" in p.lower()]
+        if not mpvs:
+            print("quit is only for the mpv mini player (none running)",
+                  file=sys.stderr)
+            return 1
+        rc, _ = run_cmd(["gdbus", "call", "--session",
+                         "--dest", mpvs[0],
+                         "--object-path", "/org/mpris/MediaPlayer2",
+                         "--method", "org.mpris.MediaPlayer2.Quit"])
+        if rc == 0:
+            print("mini player closed")
+        return rc
+    # Deterministic: the first player, transport key only. No content is
+    # named, read or selected -- pause/resume/skip and nothing else.
+    method = MEDIA_METHOD[value]
+    rc, _ = run_cmd(["gdbus", "call", "--session",
+                     "--dest", players[0],
+                     "--object-path", "/org/mpris/MediaPlayer2",
+                     "--method", f"org.mpris.MediaPlayer2.Player.{method}"])
+    if rc == 0:
+        print(f"media {value} ({players[0].split('.')[-1]})")
+    return rc
+
+
+def music_player(config_path=None):
+    """Playback backend from [music] player: "browser" (default, opens the
+    video page) or "mpv" (audio only, no window -- mpv exposes MPRIS, so the
+    media verb then pauses/skips it and the widget shows it). Anything else
+    refuses: an explicit misconfiguration must surface, not surprise."""
+    if config_path is None:
+        config_path = CONFIG_PATH
+    try:
+        text = safefile.read_text(config_path, safefile.MAX_CONFIG_BYTES)
+    except OSError:
+        return "browser"
+    current = ""
+    for line in text.splitlines():
+        match = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+        if match:
+            current = match.group(1).strip()
+            continue
+        if current == "music":
+            pair = re.match(r"^\s*player\s*=\s*\"([^\"]{1,16})\"\s*(?:#.*)?$",
+                            line)
+            if pair:
+                return pair.group(1).strip()
+    return "browser"
+
+
+def play_target(url, allowed, config_path=None):
+    """Play/resolve validated URL through the configured backend."""
+    if not any(pat.match(url) for pat in allowed):
+        print("broker resolved something unexpected; refusing", file=sys.stderr)
+        return 1
+    backend = music_player(config_path)
+    if backend in ("mpv", "mpv-video"):
+        mpv = shutil.which("mpv")
+        if mpv is None:
+            print("mpv configured but not installed", file=sys.stderr)
+            return 1
+        if backend == "mpv":
+            # Audio only, no window: mpv registers an MPRIS player, so
+            # pause / next keep working through the media verb.
+            argv = [mpv, "--no-video", "--no-terminal",
+                    "--ytdl-raw-options=extractor-args=youtube:player_client=android",
+                    "--ytdl-format=best[height<=360]/best", url]
+        else:
+            # Visible mini player: small always-on-top window, capped at
+            # 480p to keep it light. Same MPRIS controls as audio mode.
+            argv = [mpv, "--force-window", "--geometry=480x270",
+                    "--ontop", "--no-terminal",
+                    "--ytdl-raw-options=extractor-args=youtube:player_client=android",
+                    "--ytdl-format=bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+                    url]
+        spawn(argv)
+        print("playing (url not journaled)")
+        return 0
+    if backend != "browser":
+        print('unknown [music] player %r; want "browser", "mpv" or '
+              '"mpv-video"' % (backend,), file=sys.stderr)
+        return 1
+    spawn(["xdg-open", url])
+    print("opened (url not journaled)")
+    return 0
+
+
+def ytdlp_path():
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(directory, "yt-dlp")
+        if directory and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def cmd_music(query):
+    """Open the top YouTube result for a validated query. Anonymous: no
+    account, no cookies, no credentials anywhere -- pure public search."""
+    if not MUSIC_QUERY_RE.match(query):
+        print("refusing bad music query", file=sys.stderr)
+        return 1
+    yt = ytdlp_path()
+    if yt is None:
+        print("yt-dlp not installed", file=sys.stderr)
+        return 1
+    rc, out = run_cmd(
+        [yt, "--no-playlist", "--no-warnings", "--skip-download",
+         "--print", "%(webpage_url)s", f"ytsearch1:{query}"], timeout=30)
+    if rc != 0 or not out:
+        print("no result for that search", file=sys.stderr)
+        return 1
+    # autoplay=1 asks the page to start playing at once. Whether audible
+    # autoplay actually starts is the browser's call (media-engagement
+    # policy): regular YouTube watchers pass it, everyone else is one click
+    # away on an already-open video.
+    url = out.splitlines()[0].strip()
+    if "autoplay=1" not in url:
+        url += "&autoplay=1"
+    return play_target(url, (WATCH_RE,))
+
+
+def read_music_playlists(config_path=None):
+    """{lowercased name: playlist id} from [music.playlists]. Strict subset
+    parse: `name = "ID"` lines only, IDs re-validated by the caller."""
+    if config_path is None:
+        config_path = CONFIG_PATH
+    try:
+        text = safefile.read_text(config_path, safefile.MAX_CONFIG_BYTES)
+    except OSError:
+        return {}
+    current, found = "", {}
+    for line in text.splitlines():
+        match = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+        if match:
+            current = match.group(1).strip()
+            continue
+        if current != "music.playlists":
+            continue
+        pair = re.match(
+            r"^\s*([A-Za-z0-9 _.'\-]{1,40})\s*=\s*\"([^\"]{1,64})\"\s*(?:#.*)?$",
+            line)
+        if pair:
+            found[pair.group(1).strip().lower()] = pair.group(2).strip()
+    return found
+
+
+def cmd_mymusic(spec):
+    """Your library, in your logged-in browser. No credentials here: the
+    login lives in the default browser profile that xdg-open targets, and
+    account listing would need cookie decryption this broker deliberately
+    cannot do. So: liked/watch-later open their pages (you pick), and named
+    playlists from [music.playlists] autoplay their first public video --
+    falling back to the playlist page when the contents are private."""
+    norm = " ".join(spec.lower().split())
+    if not MYMUSIC_RE.match(norm):
+        print("refusing bad mymusic spec", file=sys.stderr)
+        return 1
+    if norm in ("liked", "favourites", "favorites"):
+        return play_target(
+            "https://www.youtube.com/playlist?list=LL", (PLAYLIST_PAGE_RE,))
+    if norm in ("watchlater", "watch later"):
+        return play_target(
+            "https://www.youtube.com/playlist?list=WL", (PLAYLIST_PAGE_RE,))
+    name = norm[len("playlist "):].strip()
+    playlists = read_music_playlists()
+    pid = playlists.get(name)
+    if pid is None or not PLAYLIST_ID_RE.match(pid):
+        known = ", ".join(sorted(playlists)) or "none"
+        print(f"no playlist {name!r} in [music.playlists] "
+              f"(have: {known})", file=sys.stderr)
+        return 1
+    page = f"https://www.youtube.com/playlist?list={pid}"
+    yt = ytdlp_path()
+    if yt is not None:
+        # Public playlists: resolve the first video anonymously and open it
+        # playing inside the list. Private ones fail here -> page fallback.
+        rc, out = run_cmd(
+            [yt, "--flat-playlist", "--playlist-items", "1",
+             "--no-warnings", "--skip-download", "--print", "id", page],
+            timeout=25)
+        vid = (out or "").splitlines()[0].strip() if rc == 0 else ""
+        if rc == 0 and re.match(r"^[A-Za-z0-9_-]{11}$", vid):
+            return play_target(
+                f"https://www.youtube.com/watch?v={vid}&list={pid}&autoplay=1",
+                (WATCH_LIST_RE,))
+    return play_target(page, (PLAYLIST_PAGE_RE,))
+
+
+def main(argv):
+    if not argv:
+        return usage()
+    command, rest = argv[0], argv[1:]
+
+    if command == "list":
+        for _, name in entries():
+            print(name)
+        return 0
+
+    if command == "app":
+        if not rest:
+            return usage()
+        query = " ".join(rest)
+        entry_id = resolve(query)
+        if entry_id is None:
+            print(f"no installed app matches '{query}'", file=sys.stderr)
+            return 1
+        launch(entry_id)
+        print(f"launched {entry_id}")
+        return 0
+
+    if command == "url":
+        if len(rest) != 1:
+            return usage()
+        url = rest[0]
+        # Only ever hand a real web URL to the browser.
+        if not URL_RE.match(url):
+            print("refusing non-http(s) url", file=sys.stderr)
+            return 1
+        spawn(["xdg-open", url])
+        print(f"opened {url}")
+        return 0
+
+    if command == "volume":
+        if len(rest) != 1:
+            return usage()
+        return cmd_volume(rest[0])
+
+    if command == "brightness":
+        if len(rest) != 1:
+            return usage()
+        return cmd_brightness(rest[0])
+
+    if command == "workspace":
+        if len(rest) != 1:
+            return usage()
+        return cmd_workspace(rest[0])
+
+    if command == "mute":
+        if len(rest) != 1:
+            return usage()
+        return cmd_mute(rest[0])
+
+    if command == "media":
+        if len(rest) != 1:
+            return usage()
+        return cmd_media(rest[0])
+
+    if command == "music":
+        if len(rest) != 1:
+            return usage()
+        return cmd_music(rest[0])
+
+    if command == "mymusic":
+        if len(rest) != 1:
+            return usage()
+        return cmd_mymusic(rest[0])
+
+    return usage()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

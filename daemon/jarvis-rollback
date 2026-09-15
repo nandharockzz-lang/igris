@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Return Jarvis to safe mode, for real.
+
+Configuration rollback alone cannot stop an already-running privileged
+process, so this does the stopping first:
+
+  1. terminate tracked privileged runs (jarvis-agent-run pid records)
+  2. (unless --panic) nothing else running: the daemon's own in-flight
+     agent call dies with the restart below
+  3. clear the arm state (deadline, tracked records, pipeline marker)
+  4. set agent=opencode-voice, mode=safe, actions=false in config.toml
+     (atomically, comments preserved)
+  5. restart the daemon iff it was active (a restart would ARM a stopped
+     listener, which rollback must never do)
+
+`jarvis-rollback --panic` is the panic path: stop the unit, kill tracked
+runs, clear arm state -- no config edits, no restart. The Hyprland panic
+binding runs exactly this.
+
+Usage:
+    jarvis-rollback [--config PATH] [--state-dir DIR] [--panic]
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import safefile  # noqa: E402  (needs our own directory on the path first)
+
+HOME = os.path.expanduser("~")
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+DEFAULT_CONFIG = os.path.join(CONFIG_HOME, "jarvis", "config.toml")
+
+SAFE_AGENT = "opencode-voice"
+
+
+def load_wrapper(here):
+    """Import jarvis-agent-run for its kill-tracking (same directory)."""
+    path = os.path.join(here, "jarvis-agent-run")
+    loader = importlib.machinery.SourceFileLoader("jarvis_agent_run", path)
+    spec = importlib.util.spec_from_loader("jarvis_agent_run", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def default_state_dir():
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = runtime or os.environ.get("XDG_STATE_HOME") \
+        or os.path.join(HOME, ".local", "state")
+    return os.path.join(base, "jarvis")
+
+
+def unit_active(unit="jarvis"):
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", unit],
+            capture_output=True, timeout=10, text=True)
+    except OSError:
+        return False
+    return proc.stdout.strip() == "active"
+
+
+def stop_unit(unit="jarvis"):
+    try:
+        subprocess.run(["systemctl", "--user", "stop", unit],
+                       capture_output=True, timeout=30)
+    except OSError as exc:
+        print(f"jarvis-rollback: stop failed ({exc})", file=sys.stderr)
+
+
+def restart_unit(unit="jarvis"):
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "restart", unit],
+            capture_output=True, timeout=30, text=True)
+    except OSError as exc:
+        print(f"jarvis-rollback: restart failed ({exc})", file=sys.stderr)
+        return False
+    if proc.returncode != 0:
+        print(f"jarvis-rollback: restart failed "
+              f"({proc.stderr.strip()[:200]})", file=sys.stderr)
+        return False
+    return True
+
+
+def clear_arm_state(state_dir):
+    """Remove the arm deadline, tracked records and pipeline marker."""
+    for name in ("armed_until", "privileged.pids", "state", "mode"):
+        try:
+            os.unlink(os.path.join(state_dir, name))
+        except OSError:
+            pass
+
+
+TABLE_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+
+
+def rollback_config(path):
+    """Set agent/mode/actions to the safe values, preserving comments.
+
+    Line-based like jarvis-config's set_key, extended to one key inside a
+    named section ([agents.opencode-voice] actions). Atomic via safefile.
+    Returns the list of changes made.
+    """
+    try:
+        lines = safefile.read_text(path, safefile.MAX_CONFIG_BYTES).splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError as exc:
+        raise SystemExit(f"jarvis-rollback: cannot read {path}: {exc}")
+
+    changed = []
+    current = ""
+    have_section = any(TABLE_RE.match(l) and
+                       TABLE_RE.match(l).group(1).strip()
+                       == f"agents.{SAFE_AGENT}" for l in lines)
+
+    def set_top(key, want):
+        pat = re.compile(rf"^(\s*){re.escape(key)}(\s*)=", re.ASCII)
+        for i, line in enumerate(lines):
+            if TABLE_RE.match(line):
+                break  # top-level keys live above the first table
+            match = pat.match(line)
+            if match:
+                if line.split("#", 1)[0].strip() != f"{key} = {want}":
+                    lines[i] = f'{match.group(1)}{key} = "{want}"'
+                    changed.append(key)
+                return
+        lines.insert(0, f'{key} = "{want}"')
+        changed.append(key)
+
+    set_top("agent", SAFE_AGENT)
+    set_top("mode", "safe")
+
+    if have_section:
+        current = ""
+        pat = re.compile(r"^(\s*)actions(\s*)=", re.ASCII)
+        for i, line in enumerate(lines):
+            match = TABLE_RE.match(line)
+            if match:
+                current = match.group(1).strip()
+                continue
+            if current == f"agents.{SAFE_AGENT}":
+                if pat.match(line):
+                    if "false" not in line.split("#", 1)[0]:
+                        indent = pat.match(line).group(1)
+                        lines[i] = f"{indent}actions = false"
+                        changed.append("actions")
+                    break
+
+    safefile.write_atomic(path, "\n".join(lines).rstrip("\n") + "\n")
+    return changed
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="jarvis-rollback")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--state-dir", default=None)
+    parser.add_argument("--panic", action="store_true",
+                        help="stop unit + tracked runs + clear arm; "
+                             "no config edits, no restart")
+    parser.add_argument("--unit", default="jarvis")
+    args = parser.parse_args(argv)
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    state_dir = args.state_dir or default_state_dir()
+    wrapper = load_wrapper(here)
+    wrapper._STATE_DIR_OVERRIDE = state_dir
+
+    was_active = unit_active(args.unit)
+    if was_active or args.panic:
+        stop_unit(args.unit)
+    killed, _ = wrapper.cmd_kill_tracked()
+    clear_arm_state(state_dir)
+    print(f"jarvis-rollback: stopped unit={was_active} "
+          f"privileged_killed={killed} arm_cleared=true")
+
+    if args.panic:
+        return 0
+
+    changed = rollback_config(args.config)
+    print(f"jarvis-rollback: config "
+          f"{'changed: ' + ','.join(changed) if changed else 'already safe'}")
+    if was_active:
+        ok = restart_unit(args.unit)
+        print(f"jarvis-rollback: daemon restarted={ok} "
+              "(safe config active)")
+    else:
+        print("jarvis-rollback: daemon was stopped; left stopped "
+              "(safe config applies on next arm)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

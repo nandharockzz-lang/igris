@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""Sandboxed full-tools runner behind Jarvis privileged mode.
+
+Voice never authorizes destructive ops: this wrapper -- not a prompt -- gates
+them, and the daemon's voice path NEVER invokes this wrapper (privileged mode
+requires a keyboard/button confirmation that the daemon cannot mint); a human
+at a terminal or the panel runs it directly.
+
+THE boundary is the bwrap mount container, not the argv filter below:
+  * Isolated home by construction (the ProtectHome=yes/tmpfs equivalent):
+    HOME is an empty tmpfs inside, and ONLY the restricted workspace is
+    bound in. ~/.ssh, browser profiles, tokens, unrelated ~/.config files
+    are not mounted and therefore not readable -- there is no read-only view
+    of home to escape (ProtectHome=read-only was rejected for exactly that
+    reason). Verified on this machine: `systemd-run --user -p DynamicUser`
+    is rejected by the user manager ("bad unit file setting"), so DynamicUser
+    is documented and NOT relied upon; bwrap is the sandbox.
+  * Only an explicit env allowlist crosses over; SSH_AUTH_SOCK, DBUS,
+    WAYLAND/DISPLAY and XDG_RUNTIME_DIR never do.
+  * The DENY_PATTERNS filter is confirmation-gating ONLY (destructive shapes
+    need a human's --confirm-button on this command line), plus defense in
+    depth. Even a confirmed destructive command is still confined to the
+    sandbox mounts: it can destroy the workspace, never host home.
+  * Network stays shared ONLY because the model API requires egress (it is
+    explicitly required); --no-net disables it for local-model use. The
+    agent still cannot browse: web tools stay denied in jarvis-full.md, and
+    there are no credential files inside to exfiltrate with.
+
+Every run records its pid so panic/rollback can terminate active privileged
+work (see --kill-tracked, jarvis-rollback).
+
+Usage:
+    jarvis-agent-run [--workspace DIR] [--confirm-button] [--no-net] -- COMMAND...
+    jarvis-agent-run --canary        # disposable-dir proof, both sides
+    jarvis-agent-run --kill-tracked  # SIGTERM/SIGKILL tracked sandbox runs
+
+Canary (never ~/canary.txt): mktemp -d, CANARY_A inside the workspace must
+succeed, CANARY_B outside the tree (a fake ~/.ssh) must fail.
+"""
+
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+DEFAULT_WORKSPACE = os.path.join(HOME, "VoiceWorkspace")
+
+# Where tracked-run records live: the daemon's per-user 0700 runtime dir,
+# overridable for tests. One JSON object per line: {pid, started, cmd}.
+_STATE_DIR_OVERRIDE = None
+
+
+def _runtime_dir():
+    if _STATE_DIR_OVERRIDE is not None:
+        return _STATE_DIR_OVERRIDE
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = runtime or os.environ.get("XDG_STATE_HOME") \
+        or os.path.join(HOME, ".local", "state")
+    return os.path.join(base, "jarvis")
+
+
+def _records_path():
+    return os.path.join(_runtime_dir(), "privileged.pids")
+
+# Destructive shapes, enforced on the joined argv. Bypassable ONLY by a
+# human passing --confirm-button on this command line -- the daemon's voice
+# path never does (it never invokes this wrapper at all).
+DENY_PATTERNS = [
+    (re.compile(r"\brm\s+.*-[a-z]*r"), "rm -r"),
+    (re.compile(r"(^|\s)(/|~|\\$HOME)(\\s|$)"), "rm -rf / ~ $HOME"),
+    (re.compile(r"\.ssh"), "~/.ssh"),
+    (re.compile(r"\.gnupg"), "~/.gnupg"),
+    (re.compile(r"\.config"), "~/.config"),
+    (re.compile(r"\.local/share"), "~/.local/share"),
+    (re.compile(r"Cookies|cookies.sqlite|Login Data"), "browser tokens"),
+    (re.compile(r"\b(chmod\s+.*(id_rsa|id_ed25519|\.ssh)|chmod\s+600)"),
+     "chmod of key material"),
+    (re.compile(r"\b(mkfs|dd\s+.*of=|shred)\b"), "disk destroyers"),
+    (re.compile(r"curl.*\|\s*(sh|bash)"), "curl|sh"),
+]
+
+# Env that may cross into the sandbox. Notably absent: SSH_AUTH_SOCK,
+# DBUS_SESSION_BUS_ADDRESS, WAYLAND_DISPLAY, DISPLAY, XDG_RUNTIME_DIR
+# (desktop escapes), and everything else by default. Provider keys cross
+# only by explicit name so the model can be reached without dragging the
+# rest of the environment along.
+ENV_PASSTHROUGH = (
+    "PATH", "TERM", "LANG", "LC_ALL", "TZ",
+    "OPENCODE_API_KEY", "OPENCODE_SERVER_PASSWORD", "OPENCODE_SERVER_USERNAME",
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+)
+
+
+def fail(msg):
+    print(f"jarvis-agent-run: {msg}", file=sys.stderr)
+    return 2
+
+
+def resolve_workspace(path):
+    if not os.path.isabs(path):
+        return None, "workspace must be an absolute path"
+    real = os.path.realpath(path)
+    home_real = os.path.realpath(HOME)
+    if real == home_real or real == os.path.dirname(home_real):
+        return None, "workspace must not be $HOME itself"
+    # Must not BE a sensitive dir, nor live inside one.
+    for sensitive in (".ssh", ".gnupg", ".config", ".local", ".pki"):
+        if real == os.path.join(home_real, sensitive) or real.startswith(
+                os.path.join(home_real, sensitive) + os.sep):
+            return None, f"workspace must not live in ~/{sensitive}"
+    return real, None
+
+
+def check_destructive(argv, confirmed):
+    joined = " ".join(argv)
+    for pattern, label in DENY_PATTERNS:
+        if pattern.search(joined):
+            if confirmed:
+                print(f"jarvis-agent-run: CONFIRMED destructive shape "
+                      f"({label}) -- human override", file=sys.stderr)
+                return None
+            return (f"refusing destructive shape ({label}); re-run with "
+                    "--confirm-button at a keyboard to own it -- "
+                    "voice can never pass that flag")
+    return None
+
+
+def build_bwrap(workspace, command, no_net=False):
+    # bwrap does no PATH lookup for the command: resolve to an absolute
+    # host path first, then bind it in.
+    resolved = shutil.which(command[0])
+    if resolved is None:
+        resolved = command[0]
+    command = [resolved] + list(command[1:])
+    real_bin = os.path.realpath(resolved) if os.path.isabs(resolved) else None
+    binds = ["bwrap",
+             "--die-with-parent",
+             "--unshare-pid", "--unshare-uts", "--unshare-ipc",
+             "--proc", "/proc", "--dev", "/dev",
+             "--tmpfs", "/tmp"]
+    if no_net:
+        # No network at all for the sandboxed process (local-model use).
+        # The default shares net ONLY because the model API requires egress.
+        binds.append("--unshare-net")
+    binds += [
+             # The runtime linker + libc live outside /usr on some
+             # layouts (and /bin//lib are symlinks elsewhere on others):
+             # without them every dynamically linked binary fails with a
+             # misleading "No such file or directory". -try keeps this
+             # portable across both layouts.
+             "--ro-bind", "/usr", "/usr",
+             "--ro-bind", "/bin", "/bin",
+             "--ro-bind", "/lib", "/lib",
+             "--ro-bind-try", "/lib64", "/lib64",
+              "--ro-bind", "/etc", "/etc",
+              # Empty HOME: no ssh keys, no configs, no tokens inside.
+              # (Set AFTER --clearenv below: bwrap applies options in order,
+              # so anything set before the clear is wiped.)
+              "--tmpfs", "/sandbox-home",
+             "--bind", workspace, workspace,
+             "--chdir", workspace]
+    if real_bin and os.path.exists(real_bin):
+        if os.path.realpath("/usr") != "/" and real_bin.startswith("/usr/"):
+            pass  # already covered by the /usr bind
+        else:
+            binds += ["--ro-bind", real_bin, real_bin]
+    # mise shims (and similar) live outside /usr as scripts pointing at a
+    # real binary elsewhere: bind both containing dirs read-only so the
+    # interpreter line resolves. Narrowly scoped to those dirs, never $HOME.
+    for candidate in {resolved, real_bin or ""}:
+        if (candidate and os.path.isabs(candidate)
+                and not candidate.startswith("/usr/")
+                and os.path.exists(candidate)):
+            parent = os.path.dirname(candidate)
+            binds += ["--ro-bind", parent, parent]
+    binds += ["--clearenv"]
+    binds += ["--setenv", "HOME", "/sandbox-home"]
+    # Minimal sandbox PATH: host PATH would leak mise/home dirs that do not
+    # exist inside (and bwrap resolves nothing through them anyway).
+    binds += ["--setenv", "PATH", "/usr/bin:/bin"]
+    for key in ENV_PASSTHROUGH:
+        if key == "PATH":
+            continue
+        if key in os.environ:
+            binds += ["--setenv", key, os.environ[key]]
+    binds += ["--"] + command
+    return binds
+
+
+def _read_records():
+    import json
+    try:
+        with open(_records_path()) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def _write_records(records):
+    import json
+    os.makedirs(_runtime_dir(), mode=0o700, exist_ok=True)
+    tmp = _records_path() + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as fh:
+        for record in records:
+            fh.write(json.dumps(record) + "\n")
+    os.replace(tmp, _records_path())
+
+
+def _track_start(command):
+    import json
+    record = {"pid": os.getpid(), "started": time.time(),
+              "cmd": " ".join(command)[:256]}
+    try:
+        os.makedirs(_runtime_dir(), mode=0o700, exist_ok=True)
+        with open(_records_path(), "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
+def _track_finish():
+    try:
+        _write_records([r for r in _read_records()
+                        if r.get("pid") != os.getpid()])
+    except OSError:
+        pass
+
+
+def _cmdline_of(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def cmd_kill_tracked():
+    """Terminate tracked sandbox runs. Returns (killed, skipped)."""
+    killed, skipped = 0, 0
+    live = []
+    for record in _read_records():
+        pid = record.get("pid")
+        cmdline = _cmdline_of(pid) if isinstance(pid, int) else ""
+        if pid and ("bwrap" in cmdline or "jarvis-agent-run" in cmdline):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                skipped += 1
+                continue
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not _cmdline_of(pid):
+                    break
+                time.sleep(0.2)
+            else:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            killed += 1
+            print(f"jarvis-agent-run: stopped tracked run pid {pid}")
+        else:
+            # Stale record (exited already, or pid reused by something else:
+            # never signal a pid we cannot positively identify as ours).
+            skipped += 1
+    try:
+        _write_records(live)
+    except OSError:
+        pass
+    if not killed:
+        print("jarvis-agent-run: no tracked runs to stop")
+    return killed, skipped
+
+
+def cmd_run(workspace, command, confirmed, no_net=False):
+    err = check_destructive(command, confirmed)
+    if err:
+        print(f"jarvis-agent-run: {err}", file=sys.stderr)
+        return 1
+    if not shutil.which("bwrap"):
+        print("jarvis-agent-run: bwrap not installed; refusing to run "
+              "unsandboxed", file=sys.stderr)
+        return 1
+    os.makedirs(workspace, mode=0o700, exist_ok=True)
+    argv = build_bwrap(workspace, command, no_net)
+    _track_start(command)
+    try:
+        try:
+            proc = subprocess.run(argv, check=False, timeout=3600)
+        except subprocess.TimeoutExpired:
+            print("jarvis-agent-run: timed out", file=sys.stderr)
+            return 1
+        return proc.returncode
+    finally:
+        _track_finish()
+
+
+def cmd_canary():
+    """Prove both sides in a disposable dir. Never ~/canary.txt."""
+    if not shutil.which("bwrap"):
+        print("canary: FAIL (bwrap missing)", file=sys.stderr)
+        return 1
+    tmp = tempfile.mkdtemp(prefix="jarvis-canary-")
+    try:
+        ws = os.path.join(tmp, "workspace")
+        outside = os.path.join(tmp, "fake-home", ".ssh")
+        os.makedirs(ws, mode=0o700)
+        os.makedirs(outside, mode=0o700)
+        canary_b = os.path.join(outside, "id_ed25519")
+        with open(canary_b, "w") as fh:
+            fh.write("CANARY_B_OUTSIDE\n")
+        # Side A: write+read inside the allowed tree must succeed.
+        a_write = subprocess.run(
+            build_bwrap(ws, ["sh", "-c", "echo CANARY_A_INSIDE > CANARY_A"]),
+            capture_output=True, timeout=30)
+        a_read = subprocess.run(
+            build_bwrap(ws, ["cat", os.path.join(ws, "CANARY_A")]),
+            capture_output=True, timeout=30, text=True)
+        side_a = (a_write.returncode == 0
+                  and "CANARY_A_INSIDE" in (a_read.stdout or ""))
+        # Side B: reading outside the tree must fail (empty HOME + only the
+        # workspace bound in -- the fake key path does not exist inside).
+        b_read = subprocess.run(
+            build_bwrap(ws, ["cat", canary_b]),
+            capture_output=True, timeout=30, text=True)
+        side_b = (b_read.returncode != 0
+                  and "CANARY_B_OUTSIDE" not in (b_read.stdout or ""))
+        # Side C: the sandbox HOME is empty and unrelated to host home, and
+        # inherited SSH_AUTH_SOCK never crosses (set a decoy outside, check
+        # inside). No host secret paths are reachable by construction.
+        env = dict(os.environ, SSH_AUTH_SOCK="/tmp/decoy-agent.sock")
+        home_out = subprocess.run(
+            build_bwrap(ws, ["sh", "-c", "echo $HOME"]),
+            capture_output=True, timeout=30, text=True, env=env)
+        sock_out = subprocess.run(
+            build_bwrap(ws, ["sh", "-c",
+                             "echo \"sock=${SSH_AUTH_SOCK-unset}\""]),
+            capture_output=True, timeout=30, text=True, env=env)
+        ssh_out = subprocess.run(
+            build_bwrap(ws, ["sh", "-c", "test -e ~/.ssh && echo PRESENT"]),
+            capture_output=True, timeout=30, text=True)
+        side_c = ((home_out.stdout or "").strip() == "/sandbox-home"
+                  and "sock=unset" in (sock_out.stdout or "")
+                  and "PRESENT" not in (ssh_out.stdout or ""))
+        # Destructive argv must be refused without --confirm-button.
+        refused = check_destructive(["rm", "-rf", "~"], False) is not None
+        print(f"canary: inside-workspace write+read "
+              f"{'PASS' if side_a else 'FAIL'}")
+        print(f"canary: outside-tree read blocked "
+              f"{'PASS' if side_b else 'FAIL'}")
+        print(f"canary: isolated HOME, no ~/.ssh, no SSH_AUTH_SOCK "
+              f"{'PASS' if side_c else 'FAIL'}")
+        print(f"canary: destructive argv refused "
+              f"{'PASS' if refused else 'FAIL'}")
+        ok = side_a and side_b and side_c and refused
+        print(f"canary: {'PASS' if ok else 'FAIL'} ({tmp})")
+        return 0 if ok else 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def main(argv):
+    global _STATE_DIR_OVERRIDE
+    workspace = DEFAULT_WORKSPACE
+    confirmed = False
+    no_net = False
+    command = None
+    args = list(argv)
+    # Pre-pass so --state-dir applies to --canary/--kill-tracked too.
+    for i, token in enumerate(args):
+        if token == "--state-dir" and i + 1 < len(args):
+            _STATE_DIR_OVERRIDE = args[i + 1]
+        elif token.startswith("--state-dir="):
+            _STATE_DIR_OVERRIDE = token.split("=", 1)[1]
+    if "--canary" in args:
+        return cmd_canary()
+    if "--kill-tracked" in args:
+        cmd_kill_tracked()
+        return 0
+    while args:
+        token = args.pop(0)
+        if token == "--":
+            command = args
+            break
+        if token == "--workspace" and args:
+            workspace = args.pop(0)
+        elif token.startswith("--workspace="):
+            workspace = token.split("=", 1)[1]
+        elif token == "--confirm-button":
+            confirmed = True
+        elif token == "--no-net":
+            no_net = True
+        elif token == "--state-dir" and args:
+            _STATE_DIR_OVERRIDE = args.pop(0)
+        elif token.startswith("--state-dir="):
+            _STATE_DIR_OVERRIDE = token.split("=", 1)[1]
+        else:
+            return fail(f"unknown argument {token!r} "
+                        "(usage: jarvis-agent-run [--workspace DIR] "
+                        "[--confirm-button] [--no-net] -- COMMAND...)")
+    if not command:
+        return fail("no COMMAND (usage: jarvis-agent-run [--workspace DIR] "
+                    "[--confirm-button] [--no-net] -- COMMAND...)")
+    workspace, err = resolve_workspace(workspace)
+    if err:
+        return fail(err)
+    return cmd_run(workspace, command, confirmed, no_net)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -52,10 +52,10 @@ RATE = 16000
 CHUNK_SAMPLES = 1280           # openWakeWord wants 80ms frames
 CHUNK_BYTES = CHUNK_SAMPLES * 2
 
-# openWakeWord ships these four wake-word models. The other .onnx files in
+# openWakeWord ships these wake-word models. The other .onnx files in
 # its resources dir are feature extractors and intent classifiers, not wake
 # words -- naming one still works, but these are the supported set.
-WAKE_WORDS = ("hey_jarvis", "alexa", "hey_mycroft", "hey_marvin")
+WAKE_WORDS = ("hey_jarvis", "alexa", "hey_mycroft", "hey_marvin", "igris")
 
 DEFAULTS = {
     "agent": "claude",
@@ -87,6 +87,7 @@ DEFAULTS = {
         "max_command": 15.0,
         "cooldown": 1.0,
     },
+    "draggable_avatar_enabled": True,
     "agents": {
         "claude": {
             # No {prompt} in argv: the transcript is fed to `claude -p` on
