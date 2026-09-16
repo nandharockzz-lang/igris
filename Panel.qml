@@ -599,11 +599,18 @@ command: [root.helper, "show"]
             foreground: root.fg
             accent: root.accent
             fontFamily: root.fontFamily
+            // Only installed models are offered: selecting a name with no
+            // model file would brick the listener into a restart loop.
+            // Entries may be objects {name, installed} (new) or plain
+            // strings (old show output) -- both render.
             options: {
               var out = []
               for (var i = 0; i < root.wakeWords.length; i++) {
                 var w = root.wakeWords[i]
-                out.push({ value: w, label: w.replace(/_/g, " ") })
+                var name = (typeof w === "string") ? w : w.name
+                var inst = (typeof w === "string") ? true : w.installed === true
+                if (!inst) continue
+                out.push({ value: name, label: name.replace(/_/g, " ") })
               }
               return out
             }

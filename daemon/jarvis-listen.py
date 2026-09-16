@@ -258,6 +258,14 @@ UI_TEXT_LIMIT = 1200
 # engine/model/language/vocabulary for transcription without touching the
 # user's voxtype setup (their push-to-talk keeps its own model).
 JARVIS_VOX_CONFIG = os.path.join(STATE_DIR, "voxtype.toml")
+# Custom wake-word models live here, outside the venv: a venv rebuild must
+# never eat a trained/downloaded model. This is home to an "igris" model
+# once one exists (train or download igris_vN.N.onnx into this dir).
+CUSTOM_WAKE_DIR = os.path.join(JARVIS_DIR, "wake-models")
+# Last startup refusal, for the panel. Written when config validation fails
+# (bad wake word, bad agent, bad mode/stt) so the UI can say why the mic is
+# off; cleared once the listener actually starts. Bounded text, no secrets.
+STARTUP_ERROR_FILE = os.path.join(STATE_DIR, "startup_error")
 
 # Redacted audit log. Deliberately NOT the journal and NOT under
 # XDG_RUNTIME_DIR (tmpfs, cleared on reboot): it must survive to prove
@@ -879,24 +887,72 @@ def resolve_voice(cfg):
     return voice if os.path.isabs(voice) else os.path.join(VOICES_DIR, voice)
 
 
-def resolve_wake_model(cfg):
-    """Map a wake-word name to the onnx file openWakeWord ships.
+def wake_models():
+    """Wake models actually on disk: {name: (path, score_stem)}.
 
-    Returns (path, score_key). The score key is the file stem, which is what
-    Model.predict() uses to label its scores.
+    Custom ~/.local/share/jarvis/wake-models first (survives venv
+    rebuilds; home of a trained/downloaded igris model), then the files
+    openWakeWord ships. Feature extractors (melspectrogram, embedding,
+    VAD) are skipped -- they are not wake words. The panel offers exactly
+    these keys; anything else is refused before it can kill the listener.
     """
     import openwakeword
 
+    found = {}
+    pkg = os.path.join(os.path.dirname(openwakeword.__file__),
+                       "resources", "models")
+    for models_dir in (CUSTOM_WAKE_DIR, pkg):
+        try:
+            files = sorted(os.listdir(models_dir))
+        except OSError:
+            continue
+        for f in files:
+            if not f.endswith(".onnx"):
+                continue
+            stem = os.path.splitext(f)[0]
+            if stem in ("melspectrogram", "embedding_model", "silero_vad"):
+                continue
+            name = re.sub(r"_v\d.*$", "", stem)
+            found.setdefault(name, (os.path.join(models_dir, f), stem))
+    return found
+
+
+def note_startup_error(msg):
+    """Record why the listener refused to start (panel reads this)."""
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        safefile.write_atomic(STARTUP_ERROR_FILE, str(msg)[:500])
+    except OSError:
+        pass
+
+
+def clear_startup_error():
+    try:
+        os.unlink(STARTUP_ERROR_FILE)
+    except OSError:
+        pass
+
+
+def resolve_wake_model(cfg):
+    """Map a wake-word name to an installed onnx file.
+
+    Only models wake_models() actually finds are accepted: a name with no
+    file (a not-yet-trained "igris", a typo) refuses startup with a clear
+    message instead of dying inside openWakeWord under systemd.
+    Returns (path, score_key). The score key is the file stem, which is
+    what Model.predict() uses to label its scores.
+    """
     name = cfg.get("wake_word", DEFAULTS["wake_word"])
-    models_dir = os.path.join(os.path.dirname(openwakeword.__file__),
-                              "resources", "models")
-    for stem in sorted(os.path.splitext(f)[0] for f in os.listdir(models_dir)
-                       if f.endswith(".onnx")):
-        # "hey_jarvis" should match the shipped "hey_jarvis_v0.1".
-        if stem == name or stem.rsplit("_v", 1)[0] == name:
-            return os.path.join(models_dir, stem + ".onnx"), stem
-    raise SystemExit(f"[jarvis] unknown wake_word '{name}'. "
-                     f"Available: {', '.join(WAKE_WORDS)}")
+    models = wake_models()
+    if name in models:
+        return models[name]
+    hint = ""
+    if name == "igris":
+        hint = (f" Put a trained model at {CUSTOM_WAKE_DIR}/igris_v0.1.onnx "
+                "(or run jarvis-config install-wake-word), then select it.")
+    raise SystemExit(f"[jarvis] wake_word '{name}' is not installed."
+                     f" Installed: {', '.join(sorted(models)) or 'none'}."
+                     + hint)
 
 
 # --------------------------------------------------------------------------
@@ -2205,6 +2261,7 @@ def listen_forever(agent, voice, wake_path, wake_key, listen, log_text=False,
 
     model = Model(wakeword_model_paths=[wake_path])
     log(f"model loaded, listening for '{wake_key.rsplit('_v', 1)[0].replace('_', ' ')}'")
+    clear_startup_error()  # we are up; any older refusal is stale
 
     mic = open_mic()
     clear_ui_text()
@@ -2327,14 +2384,21 @@ def main():
             print(f"{mark} {name:12} {found:15} {kind}")
         return 0
 
-    agent = select_agent(cfg)
-    voice = resolve_voice(cfg)
-    wake_path, wake_key = resolve_wake_model(cfg)
+    try:
+        agent = select_agent(cfg)
+        voice = resolve_voice(cfg)
+        wake_path, wake_key = resolve_wake_model(cfg)
+        stt = resolve_stt(cfg)
+    except SystemExit as exc:
+        # A failed config must leave a reason on screen, not a silent mic
+        # or a systemd restart loop. The panel reads this file; the unit's
+        # start limits keep a bad config from cycling forever.
+        note_startup_error(str(exc))
+        raise
     log_text = bool(cfg.get("log_transcripts", False))
     # Fail fast on a bad [stt] section (typo'd engine/model), while --check
     # and the panel can still report it -- better than a listener that
     # transcribes with the wrong model or dies on restart.
-    stt = resolve_stt(cfg)
     write_voxtype_config(stt)
 
     if args.check:

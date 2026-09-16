@@ -4,8 +4,15 @@
 # Which agent below answers. Must match an [agents.*] section.
 agent = "claude"
 
-# Wake word. These four ship with openWakeWord; no download needed:
-#   hey_jarvis  alexa  hey_mycroft  hey_marvin
+# Wake word. Only models actually installed are selectable: the shipped
+# openWakeWord ones (hey_jarvis, alexa, hey_mycroft, hey_marvin, plus timer
+# and weather), plus anything in ~/.local/share/jarvis/wake-models/.
+# "igris" names that custom slot -- train or download igris_v0.1.onnx there
+# (jarvis-config install-wake-word igris <file> validates it loads), then
+# select it. A name with no model file is refused everywhere: the panel,
+# jarvis-config set, and daemon startup -- the prior working wake word is
+# kept and the reason lands in the runtime startup_error file, never in a
+# restart loop.
 wake_word = "hey_jarvis"
 
 # Piper voice file, relative to ~/.local/share/jarvis/voices/ or absolute.

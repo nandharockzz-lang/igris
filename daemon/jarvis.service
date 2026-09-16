@@ -3,6 +3,10 @@ Description=Jarvis wake-word voice assistant
 Documentation=https://github.com/dscripka/openWakeWord
 After=pipewire.service
 Wants=pipewire.service
+# A bad config (unknown wake word, model, agent) must stay stopped with a
+# reason in the startup_error file -- never cycle the mic forever.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple

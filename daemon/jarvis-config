@@ -95,9 +95,20 @@ def coerce(key, raw):
 def validate(daemon, key, value, config_path):
     """Reject values the daemon would refuse at startup, while the panel can
     still show an error -- better than a listener that dies on restart."""
-    if key == "wake_word" and value not in daemon.WAKE_WORDS:
-        raise SystemExit(f"unknown wake_word {value!r}. "
-                         f"Available: {', '.join(daemon.WAKE_WORDS)}")
+    if key == "wake_word":
+        # Only what is actually on disk can be selected: accepting a name
+        # with no model file bricks the listener into a restart loop. The
+        # write below runs only after this passes, so a refusal keeps the
+        # prior working wake word untouched.
+        installed = daemon.wake_models()
+        if value not in installed:
+            known = ", ".join(sorted(installed)) or "none"
+            hint = ""
+            if value == "igris":
+                hint = (f" Train or download igris_v0.1.onnx, install it "
+                        f"with: jarvis-config install-wake-word igris <file>")
+            raise SystemExit(f"wake_word {value!r} is not installed. "
+                             f"Installed: {known}.{hint}")
     if key == "agent":
         cfg = daemon.load_config(config_path)
         if value not in cfg.get("agents", {}):
@@ -374,16 +385,30 @@ def cmd_show(daemon, args):
         "live": live_state(daemon),
         "workspace": workspace,
         "wake_word": cfg.get("wake_word"),
+        "wake_words": wake_word_list(daemon),
         "voice": cfg.get("voice"),
         "model": cfg.get("model", ""),  # Add top-level model setting
         "listen": listen,
         "stt": stt,
         "agents": agents,
-        "wake_words": list(daemon.WAKE_WORDS),
         "voices": voice_list(),
         "available_models": get_available_models(),  # Add available OpenCode models
     }, indent=2))
     return 0
+
+
+def wake_word_list(daemon):
+    """Every wake model the panel may offer: installed ones plus known
+    names (today: igris) flagged not-installed, so the UI offers exactly
+    what would actually work."""
+    installed = daemon.wake_models()
+    out = [{"name": name, "installed": True}
+           for name in sorted(installed)]
+    known = set(installed)
+    for name in daemon.WAKE_WORDS:
+        if name not in known:
+            out.append({"name": name, "installed": False})
+    return out
 
 
 def voice_list():
@@ -618,6 +643,51 @@ def cmd_install_voice(daemon, args):
     return 0
 
 
+MAX_WAKE_BYTES = 100_000_000  # wake models are a few MB; this is a ceiling
+
+
+def cmd_install_wake(daemon, args):
+    """Install a wake-word model file into the custom wake dir.
+
+    Usage: jarvis-config install-wake-word NAME PATH. Validates before it
+    accepts: PATH must exist under the size ceiling, and the installed file
+    must load in openWakeWord -- a corrupt download must never become a
+    selectable wake word that kills the listener on restart.
+    """
+    name = args.name
+    src = args.path
+    if not name or "/" in name or name.startswith("."):
+        raise SystemExit(f"bad wake-word name {name!r}")
+    if not os.path.isfile(src):
+        raise SystemExit(f"no such model file: {src}")
+    if os.path.getsize(src) > MAX_WAKE_BYTES:
+        raise SystemExit(f"model file too large (> {MAX_WAKE_BYTES} bytes)")
+    target_dir = daemon.CUSTOM_WAKE_DIR
+    os.makedirs(target_dir, exist_ok=True)
+    base = os.path.basename(src)
+    dest_name = base if base.startswith(name) and base.endswith(".onnx") \
+        else name + ".onnx"
+    dest = os.path.join(target_dir, dest_name)
+    import shutil
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=target_dir, prefix=".jarvis.")
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            shutil.copyfileobj(inp, out, length=1024 * 1024)
+        # Validate before accepting: the file must load as a wake model.
+        from openwakeword.model import Model
+        Model(wakeword_model_paths=[tmp])
+        os.rename(tmp, dest)
+    except Exception as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise SystemExit(f"not a loadable wake-word model: {exc}")
+    print(f"installed wake word {name} -> {dest}")
+    return 0
+
+
 def cmd_set(daemon, args):
     if args.key not in WRITABLE:
         raise SystemExit(f"{args.key!r} is not settable from here. "
@@ -639,6 +709,10 @@ def main():
     setp.add_argument("value")
     iv = sub.add_parser("install-voice", help="download a piper voice")
     iv.add_argument("voice")
+    iw = sub.add_parser("install-wake-word",
+                        help="install a wake-word .onnx file (validated)")
+    iw.add_argument("name")
+    iw.add_argument("path")
     # Add models command
     mpc = sub.add_parser("models", help="list available OpenCode models")
     mpc.add_argument("provider", nargs="?", help="provider name (only 'opencode' supported)")
@@ -650,6 +724,7 @@ def main():
         "show": cmd_show,
         "set": cmd_set,
         "install-voice": cmd_install_voice,
+        "install-wake-word": cmd_install_wake,
         "models": cmd_models,
     }[args.cmd](daemon, args)
 
