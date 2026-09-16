@@ -2432,6 +2432,8 @@ def main():
             ok = False
         if not ok:
             print("check: FAIL")
+        else:
+            clear_startup_error()  # config validates: old refusals are stale
         return 0 if ok else 1
 
     if args.ask:

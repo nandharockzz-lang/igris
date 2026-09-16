@@ -62,6 +62,11 @@ property string wakeWord: ""
    property real maxCommand: 15.0
    property string voice: ""
    property string model: ""  // Top-level model setting for OpenCode agent
+   // Listener diagnostics (daemon-published): active speech engine/model,
+   // configured wake word, and the last startup refusal, if any.
+   property string sttEngine: ""
+   property string sttModel: ""
+   property string startupError: ""
    property bool loaded: false
    property string errorText: ""
 
@@ -159,17 +164,38 @@ property string wakeWord: ""
   }
 
   // One place for every write, so the restart bookkeeping cannot drift.
+  // While armed, writes go through `apply`: validate all, write once, a
+  // single restart, readiness-awaited, rolled back on failure. Disarmed,
+  // a plain `set` (the next arm reads the file anyway).
   function apply(key, value) {
     errorText = ""
-    setProc.command = [root.helper, "set", key, String(value)]
+    if (root.armed)
+      setProc.command = [root.helper, "apply", key + "=" + String(value),
+                         "--restart-unit", "jarvis", "--wait-ready", "25"]
+    else
+      setProc.command = [root.helper, "set", key, String(value)]
     setProc.running = true
   }
 
+  // Restart with the same guarantees: readiness-awaited, and a refusal
+  // surfaces instead of leaving a stale listener running.
+  function restartNow() {
+    errorText = ""
+    root.pendingRestart = false
+    setProc.command = [root.helper, "apply",
+                       "--restart-unit", "jarvis", "--wait-ready", "25"]
+    setProc.running = true
+  }
+
+  // setProc exiting 0 means the write landed -- and, when armed, that
+  // `apply` already restarted exactly once and awaited readiness. So an
+  // armed success only reloads and clears the notice; a disarmed success
+  // waits for the next arm. Failures reload (apply rolled back) and keep
+  // the notice state honest via the setProc error path.
   function onApplied() {
     load()
     if (armed) {
       pendingRestart = false
-      restartProc.running = true
     } else {
       pendingRestart = true
     }
@@ -189,6 +215,11 @@ command: [root.helper, "show"]
           root.wakeWord = d.wake_word || ""
           root.model = d.model || ""  // Load the model setting
           root.availableModels = d.available_models || []  // Load available models
+          if (d.stt) {
+            root.sttEngine = d.stt.engine || ""
+            root.sttModel = d.stt.model || ""
+          }
+          root.startupError = d.startup_error || ""
           root.agents = d.agents || []
           root.wakeWords = d.wake_words || []
           root.voices = d.voices || []
@@ -249,26 +280,14 @@ command: [root.helper, "show"]
     }
   }
 
-  Process {
-    id: restartProc
-    command: ["systemctl", "--user", "restart", "jarvis"]
-    onExited: function(code) {
-      if (code !== 0) root.errorText = "Saved, but restarting the listener failed."
-      // A restart is the one thing that makes the running daemon current
-      // again, so it is also what clears the notice -- including the one
-      // our own write raised a moment ago.
-      else root.pendingRestart = false
-    }
-  }
-
   // The daemon reads config.toml once, at startup. Anything that edits the
   // file behind it -- the Edit config button, a text editor, another machine
   // syncing -- leaves the listener running settings that no longer match
   // what the file says, with nothing on screen to say so. Watch the file and
   // say so.
   //
-  // No guard is needed against our own writes: `set` while armed already
-  // kicks a restart, and that restart clears the notice this raises.
+  // No guard is needed against our own writes: `apply` while armed already
+  // restarts exactly once and clears the notice on success.
   FileView {
     path: root.configPath
     watchChanges: true
@@ -504,6 +523,31 @@ command: [root.helper, "show"]
               anchors.centerIn: parent
               width: parent.width - Style.space(20)
               text: root.errorText
+              color: root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+              horizontalAlignment: Text.AlignHCenter
+            }
+          }
+
+          // Last startup refusal, daemon-published. A failed change keeps
+          // the prior config (the write never lands), so this is the
+          // reason the mic is off -- fix the setting, restart, and a good
+          // start clears it.
+          BorderSurface {
+            width: parent.width
+            visible: root.startupError !== ""
+            implicitHeight: startupText.implicitHeight + Style.space(16)
+            radius: Style.cornerRadius
+            color: Style.normalFillFor(root.fg, root.accent)
+            borderSpec: Border.controlSpec("hover-cursor", root.fg, root.accent)
+
+            Text {
+              id: startupText
+              anchors.centerIn: parent
+              width: parent.width - Style.space(20)
+              text: "Listener failed to start: " + root.startupError
               color: root.fg
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -846,10 +890,7 @@ Dropdown {
               accent: root.accent
               fontFamily: root.fontFamily
               fontSize: Style.font.bodySmall
-              onClicked: {
-                root.pendingRestart = false
-                restartProc.running = true
-              }
+              onClicked: root.restartNow()
             }
 
             Button {
@@ -877,7 +918,11 @@ Dropdown {
 
           Text {
             width: parent.width
-            text: "Everything else (adding an agent, the voice) lives in the config file."
+            text: (root.sttEngine !== "" && root.sttModel !== "")
+              ? "Listener: " + root.sttEngine + "/" + root.sttModel
+                + (root.wakeWord !== "" ? " · wake " + root.wakeWord.replace(/_/g, " ") : "")
+                + "\nEverything else (adding an agent, the voice) lives in the config file."
+              : "Everything else (adding an agent, the voice) lives in the config file."
             color: Qt.darker(root.fg, 1.4)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

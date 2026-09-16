@@ -77,6 +77,45 @@ class ToggleTests(unittest.TestCase):
         if argv[:3] == ["systemctl", "--user", "restart"]:
             self.active = True
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "apply" in argv:
+            if self.set_rc != 0:
+                return SimpleNamespace(stdout="", stderr="refused",
+                                       returncode=1)
+            # emulate jarvis-config apply for real: parse pairs, write the
+            # mode/actions lines, and -- when asked to restart -- publish
+            # fresh daemon state files like a healthy startup would.
+            import re
+            pairs = [a for a in argv[1:]
+                     if "=" in a and not a.startswith("-")]
+            text = open(self.cfg).read()
+            if any(p.startswith("actions=") for p in pairs) \
+                    and "[agents." not in text:
+                return SimpleNamespace(stdout="",
+                                       stderr="no [agents.x] section",
+                                       returncode=1)
+            for pair in pairs:
+                key, _, value = pair.partition("=")
+                if key == "mode":
+                    lines = [l if not l.startswith("mode =")
+                             else f'mode = "{value}"'
+                             for l in text.splitlines()]
+                    text = "\n".join(lines) + "\n"
+                elif key == "actions":
+                    text = re.sub(r"actions = (true|false)",
+                                  f"actions = {value}", text, count=1)
+            open(self.cfg, "w").write(text)
+            if "--restart-unit" in argv:
+                self.active = True
+                mode = "safe"
+                for line in text.splitlines():
+                    if line.startswith("mode ="):
+                        mode = line.split("=")[1].strip().strip('"')
+                with open(os.path.join(self.state, "mode"), "w") as fh:
+                    fh.write(mode)
+                with open(os.path.join(self.state, "state"), "w") as fh:
+                    fh.write("idle")
+            return SimpleNamespace(stdout="applied; restarted and ready",
+                                   stderr="", returncode=0)
         if "set" in argv:
             if self.set_rc != 0:
                 return SimpleNamespace(stdout="", stderr="refused",

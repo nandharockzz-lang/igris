@@ -76,8 +76,7 @@ WRITABLE = {
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
-def coerce(key, raw):
-    kind = WRITABLE[key]
+def coerce_kind(kind, key, raw):
     if kind == "float":
         try:
             return float(raw)
@@ -90,6 +89,10 @@ def coerce(key, raw):
     if CONTROL_CHARS.search(raw):
         raise SystemExit(f"{key} may not contain control characters")
     return raw
+
+
+def coerce(key, raw):
+    return coerce_kind(WRITABLE[key], key, raw)
 
 
 def validate(daemon, key, value, config_path):
@@ -236,24 +239,20 @@ def installed_voices():
 TABLE_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 
 
-def set_key(path, dotted, value):
-    """Replace one `key = value` line, preserving comments and layout.
+def _run(argv, timeout=30):
+    """Subprocess seam (tests replace this; never a shell)."""
+    import subprocess
+    return subprocess.run(argv, capture_output=True, timeout=timeout,
+                          text=True)
 
-    The key may be top-level ("agent") or one level deep ("listen.cooldown").
-    Missing tables and missing keys are created.
-    """
+
+def _apply_one(lines, dotted, value):
+    """Replace one `key = value` line in memory, preserving comments and
+    layout. The key may be top-level ("agent") or one level deep
+    ("listen.cooldown"). Missing tables and missing keys are created.
+    Returns "updated"/"added"; the caller writes once."""
     table, _, leaf = dotted.rpartition(".")
     rendered = f"{leaf} = {format_value(value)}"
-
-    try:
-        # The config path is predictable and this runs behind a GUI button,
-        # so read it descriptor-first: no symlink, no blocking on a planted
-        # FIFO, and a ceiling on how much we will pull in.
-        lines = safefile.read_text(path, safefile.MAX_CONFIG_BYTES).splitlines()
-    except FileNotFoundError:
-        lines = []
-    except OSError as exc:
-        raise SystemExit(f"cannot read {path}: {exc}")
 
     key_re = re.compile(rf"^(\s*){re.escape(leaf)}(\s*)=", re.ASCII)
 
@@ -287,7 +286,6 @@ def set_key(path, dotted, value):
                 # Preserve the original indentation and alignment.
                 indent = key_re.match(line).group(1)
                 lines[i] = f"{indent}{rendered}{trailing_comment(line)}"
-                write(path, lines)
                 return "updated"
 
     # Key absent: append to its table, creating the table if needed.
@@ -300,8 +298,48 @@ def set_key(path, dotted, value):
         lines.insert(0, rendered)
     else:
         lines.insert(table_end + 1, rendered)
-    write(path, lines)
     return "added"
+
+
+def _apply_actions(lines, agent, want):
+    """Flip `actions` inside [agents.<agent>] in memory. The one writer
+    besides a hand-edit; refuses to invent a section or key, mirroring the
+    toggle's old file writer. Returns an error string, or None on success."""
+    want_text = "true" if want else "false"
+    section = f"agents.{agent}"
+    current, found_section = "", False
+    key_re = re.compile(r"^(\s*)actions(\s*)=", re.ASCII)
+    for i, line in enumerate(lines):
+        match = TABLE_RE.match(line)
+        if match:
+            current = match.group(1).strip()
+            found_section = found_section or current == section
+            continue
+        if current == section and key_re.match(line):
+            value = line.split("#", 1)[0]
+            if ("true" in value) == want:
+                return None  # already what we want: touch nothing
+            lines[i] = f"{key_re.match(line).group(1)}actions = {want_text}"
+            return None
+    if not found_section:
+        return f"no [{section}] section in config; refusing to invent one"
+    return f"no actions key in [{section}]; refusing to invent one"
+
+
+def set_key(path, dotted, value):
+    """Replace one `key = value` line, preserving comments and layout."""
+    try:
+        # The config path is predictable and this runs behind a GUI button,
+        # so read it descriptor-first: no symlink, no blocking on a planted
+        # FIFO, and a ceiling on how much we will pull in.
+        lines = safefile.read_text(path, safefile.MAX_CONFIG_BYTES).splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError as exc:
+        raise SystemExit(f"cannot read {path}: {exc}")
+    result = _apply_one(lines, dotted, value)
+    write(path, lines)
+    return result
 
 
 def write(path, lines):
@@ -386,6 +424,7 @@ def cmd_show(daemon, args):
         "workspace": workspace,
         "wake_word": cfg.get("wake_word"),
         "wake_words": wake_word_list(daemon),
+        "startup_error": startup_error_text(daemon),
         "voice": cfg.get("voice"),
         "model": cfg.get("model", ""),  # Add top-level model setting
         "listen": listen,
@@ -409,6 +448,17 @@ def wake_word_list(daemon):
         if name not in known:
             out.append({"name": name, "installed": False})
     return out
+
+
+def startup_error_text(daemon):
+    """Last startup refusal for the panel ("" when the listener is fine).
+
+    Bounded daemon-published text, never transcripts or arguments.
+    """
+    try:
+        return safefile.read_text(daemon.STARTUP_ERROR_FILE, 500).strip()
+    except OSError:
+        return ""
 
 
 def voice_list():
@@ -688,6 +738,190 @@ def cmd_install_wake(daemon, args):
     return 0
 
 
+def unit_is_active(unit):
+    try:
+        proc = _run(["systemctl", "--user", "is-active", unit], timeout=10)
+    except Exception:
+        return False
+    return proc.stdout.strip() == "active"
+
+
+def await_ready(daemon, unit, want_mode, t0, timeout):
+    """Poll until the restarted listener proves it is up.
+
+    Ready = unit active, no fresh refusal, a freshly published pipeline
+    state (the daemon writes it after the mic opens), and -- when the
+    transition requested a mode -- that mode published fresh. Stale files
+    from a dead daemon never count: everything is gated on mtime >= t0.
+    Returns an error string, or None when ready.
+    """
+    import time
+    deadline = t0 + timeout
+    while True:
+        try:
+            err_mtime = os.path.getmtime(daemon.STARTUP_ERROR_FILE)
+        except OSError:
+            err_mtime = 0
+        if err_mtime >= t0:
+            try:
+                msg = safefile.read_text(daemon.STARTUP_ERROR_FILE,
+                                         500).strip()
+            except OSError:
+                msg = ""
+            return ("listener refused the new config: "
+                    f"{msg or 'see journalctl --user -u ' + unit}")
+        if unit_is_active(unit):
+            try:
+                state_fresh = os.path.getmtime(daemon.STATE_FILE) >= t0
+            except OSError:
+                state_fresh = False
+            mode_ok = True
+            if want_mode:
+                try:
+                    mode_ok = (safefile.read_text(daemon.MODE_FILE, 64)
+                               .strip() == want_mode
+                               and os.path.getmtime(daemon.MODE_FILE) >= t0)
+                except OSError:
+                    mode_ok = False
+            if state_fresh and mode_ok:
+                return None
+        if time.time() >= deadline:
+            return (f"unit did not become ready within {timeout:.0f}s "
+                    f"(see journalctl --user -u {unit})")
+        time.sleep(0.5)
+
+
+def rollback_config(daemon, config_path, snapshot, t0):
+    """Restore the pre-transition config bytes and drop a refusal the
+    failed attempt wrote (stale-state recovery: the panel must not show
+    an error for a config that is no longer on disk)."""
+    try:
+        if snapshot is None:
+            try:
+                os.unlink(config_path)
+            except OSError:
+                pass
+        else:
+            import tempfile
+            fd, tmp = tempfile.mkstemp(
+                dir=os.path.dirname(os.path.abspath(config_path)),
+                prefix=".jarvis.")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(snapshot)
+                os.replace(tmp, config_path)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+    except OSError as exc:
+        return f"ROLLBACK FAILED ({exc}): config may be half-written"
+    try:
+        if os.path.getmtime(daemon.STARTUP_ERROR_FILE) >= t0:
+            os.unlink(daemon.STARTUP_ERROR_FILE)
+    except OSError:
+        pass
+    return None
+
+
+def cmd_apply(daemon, args):
+    """Atomic transition: validate everything, write once, restart at most
+    once, await readiness, roll back on failure.
+
+    Pairs are KEY=VALUE with KEY in WRITABLE plus `actions` (flips the
+    actions flag in [agents.<current>] -- the toggle's physical-act path;
+    the panel never sends it). Without --restart-unit this is a validated
+    multi-write; with it, one restart, readiness-gated, rolled back --
+    config and daemon included -- on any failure.
+    """
+    import time
+    kinds = dict(WRITABLE)
+    kinds["actions"] = "bool"
+    edits = []
+    for pair in args.pairs:
+        if "=" not in pair:
+            raise SystemExit(f"apply needs KEY=VALUE, got {pair!r}")
+        key, _, raw = pair.partition("=")
+        key = key.strip()
+        if key not in kinds:
+            raise SystemExit(
+                f"{key!r} is not appliable. "
+                f"Appliable: {', '.join(sorted(kinds))}")
+        edits.append((key, coerce_kind(kinds[key], key, raw)))
+    # Validate everything before writing anything.
+    cfg = daemon.load_config(args.config)
+    for key, value in edits:
+        if key != "actions":
+            validate(daemon, key, value, args.config)
+    try:
+        with open(args.config, "rb") as fh:
+            snapshot = fh.read(safefile.MAX_CONFIG_BYTES + 1)
+    except FileNotFoundError:
+        snapshot = None
+    except OSError as exc:
+        raise SystemExit(f"cannot read {args.config}: {exc}")
+    try:
+        lines = safefile.read_text(args.config,
+                                   safefile.MAX_CONFIG_BYTES).splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError as exc:
+        raise SystemExit(f"cannot read {args.config}: {exc}")
+    agent = cfg.get("agent", "")
+    for key, value in edits:
+        if key == "actions":
+            err = _apply_actions(lines, agent, value)
+            if err:
+                raise SystemExit(err)
+        else:
+            _apply_one(lines, key, value)
+    if edits:
+        write(args.config, lines)
+    applied = ", ".join(f"{k}={format_value(v)}" for k, v in edits)
+    if not args.restart_unit:
+        print(f"applied {applied or 'nothing'} "
+              "(takes effect on next start)")
+        return 0
+    unit = args.restart_unit
+    was_active = unit_is_active(unit)
+    t0 = time.time()
+    try:
+        proc = _run(["systemctl", "--user", "restart", unit], timeout=60)
+    except Exception as exc:
+        proc = None
+        restart_err = f"systemctl restart failed ({exc})"
+    else:
+        restart_err = None
+        if proc.returncode != 0:
+            restart_err = ("systemctl restart failed "
+                           f"({(proc.stderr or proc.stdout).strip()[:160]})")
+
+    def failed(reason):
+        rb = rollback_config(daemon, args.config, snapshot, t0)
+        try:
+            if was_active:
+                _run(["systemctl", "--user", "restart", unit], timeout=60)
+            else:
+                _run(["systemctl", "--user", "stop", unit], timeout=30)
+        except Exception:
+            pass
+        msg = f"{reason}; config rolled back"
+        if rb:
+            msg += f"; {rb}"
+        raise SystemExit(msg)
+
+    if restart_err:
+        failed(restart_err)
+    want_mode = dict(edits).get("mode")
+    err = await_ready(daemon, unit, want_mode, t0, args.wait_ready)
+    if err:
+        failed(err)
+    print(f"applied {applied or 'nothing'}; {unit} restarted and ready")
+    return 0
+
+
 def cmd_set(daemon, args):
     if args.key not in WRITABLE:
         raise SystemExit(f"{args.key!r} is not settable from here. "
@@ -707,6 +941,15 @@ def main():
     setp = sub.add_parser("set", help="change one setting")
     setp.add_argument("key")
     setp.add_argument("value")
+    ap = sub.add_parser("apply",
+                        help="atomic multi-key transition with readiness "
+                             "and rollback")
+    ap.add_argument("pairs", nargs="*", help="KEY=VALUE (plus actions=bool)")
+    ap.add_argument("--restart-unit", default=None,
+                    help="restart this user unit at most once and await "
+                         "readiness (also starts it when inactive)")
+    ap.add_argument("--wait-ready", type=float, default=25,
+                    help="seconds to await readiness (default: 25)")
     iv = sub.add_parser("install-voice", help="download a piper voice")
     iv.add_argument("voice")
     iw = sub.add_parser("install-wake-word",
@@ -723,6 +966,7 @@ def main():
     return {
         "show": cmd_show,
         "set": cmd_set,
+        "apply": cmd_apply,
         "install-voice": cmd_install_voice,
         "install-wake-word": cmd_install_wake,
         "models": cmd_models,

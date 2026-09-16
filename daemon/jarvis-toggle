@@ -122,45 +122,24 @@ def read_section_key(config_path, section, key, default):
     return default
 
 
-def set_actions(config_path, agent, want):
-    """Set `actions` inside [agents.<agent>] ONLY. This is the one writer
-    besides a hand-edit: the toggle is a physical act (hotkey/click), so it
-    may own this flag the way a hand-edit does. The panel/QML path can never
-    reach this function (jarvis-config refuses all of [agents.*]) and voice
-    has no code path here at all. Atomic, comments preserved. Returns an
-    error string, or None on success."""
-    import re
-    want_text = "true" if want else "false"
+def apply_config(config_bin, config_path, pairs, unit=None,
+                 wait_ready=25):
+    """One atomic transition via jarvis-config apply: validate all, write
+    once, restart at most once, await readiness, roll back on failure.
+    Returns an error string, or None on success."""
+    cmd = [config_bin, "--config", config_path, "apply"]
+    cmd += [f"{key}={value}" for key, value in pairs]
+    if unit is not None:
+        cmd += ["--restart-unit", unit, "--wait-ready", str(wait_ready)]
     try:
-        lines = safefile.read_text(
-            config_path, safefile.MAX_CONFIG_BYTES).splitlines()
-    except OSError as exc:
-        return f"cannot read config ({exc})"
-    section = f"agents.{agent}"
-    current, found_section, done = "", False, False
-    key_re = re.compile(r"^(\s*)actions(\s*)=", re.ASCII)
-    for i, line in enumerate(lines):
-        match = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
-        if match:
-            current = match.group(1).strip()
-            found_section = found_section or current == section
-            continue
-        if current == section and key_re.match(line):
-            value = line.split("#", 1)[0]
-            if ("true" in value) == want:
-                return None  # already what we want: touch nothing
-            lines[i] = f"{key_re.match(line).group(1)}actions = {want_text}"
-            done = True
-            break
-    if not found_section:
-        return f"no [{section}] section in config; refusing to invent one"
-    if not done:
-        return f"no actions key in [{section}]; refusing to invent one"
-    try:
-        safefile.write_atomic(
-            config_path, "\n".join(lines).rstrip("\n") + "\n")
-    except OSError as exc:
-        return f"cannot write config ({exc})"
+        proc = _run(cmd, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not run jarvis-config apply ({exc})"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        detail = [line for line in detail
+                  if not line.startswith("[jarvis] config")]
+        return detail[-1][:300] if detail else "jarvis-config apply refused"
     return None
 
 
@@ -189,20 +168,6 @@ def read_state(state_dir, unit):
                         or (deadline is not None and deadline > time.time()))
     return {"running": running, "mode": mode, "deadline": deadline,
             "live": live}
-
-
-def set_mode(config_bin, config_path, mode):
-    """Request a mode through jarvis-config (daemon validation applies)."""
-    try:
-        proc = _run([config_bin, "--config", config_path,
-                     "set", "mode", mode], timeout=30)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"could not run jarvis-config ({exc})"
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip().splitlines()
-        detail = [l for l in detail if not l.startswith("[jarvis] config")]
-        return detail[-1][:200] if detail else "jarvis-config refused"
-    return None
 
 
 def control_unit(unit, action, wait_active=None, timeout=8):
@@ -273,6 +238,8 @@ def main(argv=None):
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--state-dir", default=None)
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--wait-ready", type=float, default=25,
+                        help="seconds apply awaits listener readiness")
     args = parser.parse_args(argv)
 
     state_dir = args.state_dir or default_state_dir()
@@ -295,14 +262,14 @@ def main(argv=None):
     # Full and live -> second press disarms (stops new tool calls; tracked
     # human-confirmed runs are panic's job, not the toggle's). Disarm also
     # returns the actions flag so a later Safe arm can never refuse startup.
+    # The unit is already stopped, so this is a validated write, no restart.
     if state["running"] and state["mode"] == "privileged" and state["live"]:
         err = control_unit(args.unit, "stop", wait_active=False)
         clear_arm(state_dir)
         if err:
             fail_note(err)
             return 1
-        agent = read_top_key(args.config, "agent", "opencode-voice")
-        err = set_actions(args.config, agent, False)
+        err = apply_config(config_bin, args.config, [("actions", "false")])
         if err:
             fail_note(f"disarmed, but {err}")
             return 1
@@ -310,23 +277,17 @@ def main(argv=None):
         print("disarmed Full mode")
         return 0
 
-    # Basic and live -> step up to Full.
+    # Basic and live -> step up to Full. One atomic transition: both fields
+    # validated, written once, a single restart, readiness-awaited, rolled
+    # back (config and daemon) on failure.
     if state["running"] and state["mode"] == "workspace" and state["live"]:
         wrapper = find_helper("jarvis-agent-run")
         if wrapper is None:
             fail_note("privileged mode needs jarvis-agent-run installed")
             return 1
-        err = set_mode(config_bin, args.config, "privileged")
-        if err:
-            fail_note(err)
-            return 1
-        agent = read_top_key(args.config, "agent", "opencode-voice")
-        err = set_actions(args.config, agent, True)
-        if err:
-            set_mode(config_bin, args.config, "workspace")
-            fail_note(err)
-            return 1
-        err = control_unit(args.unit, "restart", wait_active=True)
+        err = apply_config(config_bin, args.config,
+                           [("mode", "privileged"), ("actions", "true")],
+                           unit=args.unit, wait_ready=args.wait_ready)
         if err:
             fail_note(err)
             return 1
@@ -337,21 +298,12 @@ def main(argv=None):
         return 0
 
     # Stopped, expired, or safe -> arm Basic: workspace mode plus the broker
-    # verbs flag, so commands work the moment it arms. The daemon validates
-    # the combination at startup; a refusal aborts before arming.
-    prev_mode = read_top_key(args.config, "mode", "safe")
-    err = set_mode(config_bin, args.config, "workspace")
-    if err:
-        fail_note(err)
-        return 1
-    agent = read_top_key(args.config, "agent", "opencode-voice")
-    err = set_actions(args.config, agent, True)
-    if err:
-        set_mode(config_bin, args.config, prev_mode)
-        fail_note(err)
-        return 1
-    action = "restart" if state["running"] else "start"
-    err = control_unit(args.unit, action, wait_active=True)
+    # verbs flag, so commands work the moment it arms. One atomic transition;
+    # the daemon validates the combination, and a refusal aborts before (and
+    # without) arming.
+    err = apply_config(config_bin, args.config,
+                       [("mode", "workspace"), ("actions", "true")],
+                       unit=args.unit, wait_ready=args.wait_ready)
     if err:
         fail_note(err)
         return 1
