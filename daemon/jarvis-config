@@ -54,6 +54,12 @@ WRITABLE = {
     "listen.min_speech":      "float",
     "listen.max_command":     "float",
     "listen.cooldown":        "float",
+    "stt.engine":             "str",
+    "stt.model":              "str",
+    "stt.language":           "str",
+    "stt.vocabulary":         "str",
+    "stt.cloud_fallback":     "bool",
+    "stt.fallback_engine":    "str",
     "workspace.auto_disarm_seconds": "float",
     "workspace.full_disarm_seconds": "float",
 }
@@ -149,6 +155,23 @@ def validate(daemon, key, value, config_path):
         raise SystemExit(f"{key} must be positive")
     if key == "draggable_avatar_enabled" and not isinstance(value, bool):
         raise SystemExit("draggable_avatar_enabled must be true or false")
+    if key == "stt.engine" and value not in daemon.STT_ENGINES:
+        raise SystemExit(f"unknown stt engine {value!r}. "
+                         f"Available: {', '.join(daemon.STT_ENGINES)}")
+    if key == "stt.model":
+        cfg = daemon.load_config(config_path)
+        engine = cfg.get("stt", {}).get("engine",
+                                        daemon.DEFAULTS["stt"]["engine"])
+        allowed = daemon.WHISPER_MODELS if engine == "whisper" \
+            else daemon.PARAKEET_MODELS
+        if value not in allowed:
+            raise SystemExit(f"unknown {engine} model {value!r}. "
+                             f"Available: {', '.join(allowed)}")
+    if key in ("stt.language", "stt.fallback_engine") and not value.strip():
+        raise SystemExit(f"{key} cannot be empty")
+    if key == "stt.vocabulary" and len(value) > 500:
+        raise SystemExit("stt vocabulary is a short bias list, not prose "
+                         "(500 chars max)")
 
 
 def format_value(value):
@@ -324,6 +347,7 @@ def cmd_show(daemon, args):
     listen = daemon.merge(daemon.DEFAULTS["listen"], cfg.get("listen", {}))
     workspace = daemon.merge(daemon.DEFAULTS["workspace"],
                              cfg.get("workspace", {}))
+    stt = daemon.merge(daemon.DEFAULTS["stt"], cfg.get("stt", {}))
 
     agents = []
     for name in sorted(cfg.get("agents", {})):
@@ -353,6 +377,7 @@ def cmd_show(daemon, args):
         "voice": cfg.get("voice"),
         "model": cfg.get("model", ""),  # Add top-level model setting
         "listen": listen,
+        "stt": stt,
         "agents": agents,
         "wake_words": list(daemon.WAKE_WORDS),
         "voices": voice_list(),

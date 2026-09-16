@@ -57,6 +57,19 @@ CHUNK_BYTES = CHUNK_SAMPLES * 2
 # words -- naming one still works, but these are the supported set.
 WAKE_WORDS = ("hey_jarvis", "alexa", "hey_mycroft", "hey_marvin", "igris")
 
+# Speech engines Jarvis can drive through `voxtype transcribe --engine`.
+# Only whisper is verified against this voxtype binary today (parakeet and
+# friends need an ONNX-variant rebuild); parakeet stays listed so the
+# config layer -- and the benchmark -- already speak its names.
+STT_ENGINES = ("whisper", "parakeet")
+WHISPER_MODELS = ("tiny", "tiny.en", "base", "base.en", "small", "small.en",
+                  "medium", "medium.en", "large-v3", "large-v3-turbo")
+PARAKEET_MODELS = ("parakeet-tdt-0.6b-v2", "parakeet-tdt-0.6b-v2-int8",
+                   "parakeet-tdt-0.6b-v3", "parakeet-tdt-0.6b-v3-int8",
+                   "parakeet-unified-en-0.6b")
+VOXTYPE_MODELS_DIR = os.path.join(os.path.expanduser("~"), ".local", "share",
+                                  "voxtype", "models")
+
 DEFAULTS = {
     "agent": "claude",
     "wake_word": "hey_jarvis",
@@ -88,6 +101,22 @@ DEFAULTS = {
         "cooldown": 1.0,
     },
     "draggable_avatar_enabled": True,
+    "stt": {
+        "engine": "whisper",
+        # Round-1 benchmark (14 TTS commands, this CPU): base.en and
+        # small.en tie on accuracy (WER 0.058) while base.en answers in
+        # 1.4s vs 9.1s. Bigger is not better here; revisit after the
+        # recorded-mic round and the parakeet comparison.
+        "model": "base.en",
+        "language": "en",
+        # Command-vocabulary bias for whisper's initial prompt. Short nouns
+        # and verbs from the broker grammar, not sentences.
+        "vocabulary": "jarvis firefox terminal workspace volume brightness screenshot",
+        # Opt-in cloud fallback for empty local transcripts. Off by
+        # default: local-first, and a cloud engine sends audio off-machine.
+        "cloud_fallback": False,
+        "fallback_engine": "soniox",
+    },
     "agents": {
         "claude": {
             # No {prompt} in argv: the transcript is fed to `claude -p` on
@@ -225,6 +254,10 @@ TOOL_FILE = os.path.join(STATE_DIR, "tool")
 REQUEST_FILE = os.path.join(STATE_DIR, "request")
 RESPONSE_FILE = os.path.join(STATE_DIR, "response")
 UI_TEXT_LIMIT = 1200
+# Jarvis-owned voxtype config, materialized at startup: pins
+# engine/model/language/vocabulary for transcription without touching the
+# user's voxtype setup (their push-to-talk keeps its own model).
+JARVIS_VOX_CONFIG = os.path.join(STATE_DIR, "voxtype.toml")
 
 # Redacted audit log. Deliberately NOT the journal and NOT under
 # XDG_RUNTIME_DIR (tmpfs, cleared on reboot): it must survive to prove
@@ -1359,11 +1392,66 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 VOXTYPE_NOISE = ("Loading ", "Audio format:", "Processing ", "whisper_")
 
 
-def transcribe(path):
-    """Run voxtype's local whisper model. It logs to stdout, so take the tail."""
-    proc = run_bounded(["voxtype", "transcribe", path], timeout=120)
+def resolve_stt(cfg):
+    """Validate the [stt] section, failing loudly on typos.
+
+    A misspelled engine or model must refuse startup with a clear message,
+    not silently transcribe with whatever voxtype happens to default to.
+    """
+    stt = merge(DEFAULTS["stt"], cfg.get("stt", {}))
+    engine = stt.get("engine", "whisper")
+    if engine not in STT_ENGINES:
+        raise SystemExit(f"[jarvis] unknown stt engine {engine!r}. "
+                         f"Available: {', '.join(STT_ENGINES)}")
+    model = stt.get("model", "")
+    allowed = WHISPER_MODELS if engine == "whisper" else PARAKEET_MODELS
+    if model not in allowed:
+        raise SystemExit(f"[jarvis] unknown {engine} model {model!r}. "
+                         f"Available: {', '.join(allowed)}")
+    if engine == "whisper" and not os.path.isabs(model):
+        # An absolute path names a custom .bin; otherwise the file must be
+        # on disk already -- downloading happens outside the daemon.
+        if not os.path.exists(os.path.join(VOXTYPE_MODELS_DIR,
+                                            f"ggml-{model}.bin")):
+            raise SystemExit(
+                f"[jarvis] whisper model {model!r} is not downloaded. "
+                f"Run: voxtype setup model (pick it), then restart Jarvis.")
+    if not str(stt.get("language") or "").strip():
+        raise SystemExit("[jarvis] stt language cannot be empty")
+    if not str(stt.get("fallback_engine") or "").strip():
+        raise SystemExit("[jarvis] stt fallback_engine cannot be empty")
+    return stt
+
+
+def write_voxtype_config(stt):
+    """Materialize the jarvis-owned voxtype config for transcription.
+
+    Minimal on purpose: transcribe only needs the engine section. The
+    user's own config is never read or written here.
+    """
+    if stt["engine"] == "whisper":
+        text = ("[whisper]\n"
+                f"model = \"{stt['model']}\"\n"
+                f"language = \"{stt['language']}\"\n"
+                f"initial_prompt = \"{stt.get('vocabulary', '')}\"\n")
+    else:
+        text = ("[parakeet]\n"
+                f"model = \"{stt['model']}\"\n")
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    safefile.write_atomic(JARVIS_VOX_CONFIG, text)
+
+
+def _transcribe_once(cmd):
+    """One voxtype run: transcript tail, or '' on any failure."""
+    try:
+        proc = run_bounded(cmd, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        raise
     if proc.overflowed:
         log("voxtype exceeded its output ceiling; transcription discarded")
+        return ""
+    if proc.returncode != 0:
+        log(f"voxtype transcribe failed (exit {proc.returncode})")
         return ""
     lines = []
     for raw in proc.stdout.splitlines():
@@ -1374,6 +1462,25 @@ def transcribe(path):
             continue
         lines.append(line)
     return lines[-1] if lines else ""
+
+
+def transcribe(path, stt):
+    """Run the configured local STT engine; opt-in cloud fallback on empty.
+
+    Local passes use the jarvis-owned -c config (pinned model, command
+    vocabulary prompt). The cloud fallback, when enabled, goes through the
+    user's own voxtype config -- their keys, their explicit opt-in -- and
+    only when local transcription came back empty.
+    """
+    text = _transcribe_once(["voxtype", "-c", JARVIS_VOX_CONFIG,
+                             "transcribe", "--engine", stt["engine"], path])
+    if not text and stt.get("cloud_fallback"):
+        fb = stt.get("fallback_engine") or ""
+        if fb:
+            log(f"local transcription empty; trying cloud fallback ({fb})")
+            text = _transcribe_once(["voxtype", "transcribe",
+                                     "--engine", fb, path])
+    return text
 
 
 def ask_agent(agent, prompt, web=False):
@@ -2046,7 +2153,7 @@ def respond(agent, voice, text, log_text=False, mode="safe",
 
 
 def handle_command(mic, ambient, agent, voice, listen, log_text=False,
-                   mode="safe"):
+                   mode="safe", stt=None):
     focus = begin_playback_focus()
     text = ""
     try:
@@ -2063,7 +2170,7 @@ def handle_command(mic, ambient, agent, voice, listen, log_text=False,
             write_wav(samples, path)
             set_state("thinking")
             chime("stop")
-            text = transcribe(path)
+            text = transcribe(path, stt or DEFAULTS["stt"])
         except subprocess.TimeoutExpired:
             # One slow transcription should cost you one question, not the
             # listener. Letting this escape kills the daemon, and systemd's
@@ -2093,7 +2200,7 @@ def handle_command(mic, ambient, agent, voice, listen, log_text=False,
 # --------------------------------------------------------------------------
 
 def listen_forever(agent, voice, wake_path, wake_key, listen, log_text=False,
-                   mode="safe", auto_disarm_seconds=0):
+                   mode="safe", auto_disarm_seconds=0, stt=None):
     from openwakeword.model import Model
 
     model = Model(wakeword_model_paths=[wake_path])
@@ -2160,7 +2267,7 @@ def listen_forever(agent, voice, wake_path, wake_key, listen, log_text=False,
                 note_wake()  # 2s avatar flash, distinct from recording
                 clear_ui_text()
                 handle_command(mic, ambient, agent, voice, listen, log_text,
-                               mode)
+                               mode, stt)
                 refresh_arm_window()
                 # Nothing drained the mic while we were thinking and speaking,
                 # so the pipe holds seconds of stale audio (including our own
@@ -2224,6 +2331,11 @@ def main():
     voice = resolve_voice(cfg)
     wake_path, wake_key = resolve_wake_model(cfg)
     log_text = bool(cfg.get("log_transcripts", False))
+    # Fail fast on a bad [stt] section (typo'd engine/model), while --check
+    # and the panel can still report it -- better than a listener that
+    # transcribes with the wrong model or dies on restart.
+    stt = resolve_stt(cfg)
+    write_voxtype_config(stt)
 
     if args.check:
         ok = True
@@ -2235,6 +2347,14 @@ def main():
             found = shutil.which(cmd)
             ok &= bool(found)
             print(f"{'ok ' if found else 'MISSING'}  {cmd}: {found or '-'}")
+        fb = f" +cloud-fallback:{stt['fallback_engine']}" \
+            if stt.get("cloud_fallback") else ""
+        print(f"ok   stt: {stt['engine']}/{stt['model']} "
+              f"({stt['language']}){fb}")
+        vox_ok = os.path.exists(JARVIS_VOX_CONFIG)
+        ok &= vox_ok
+        print(f"{'ok ' if vox_ok else 'MISSING'}  voxtype config: "
+              f"{JARVIS_VOX_CONFIG}")
         print(f"mode: {mode}")
         print(f"{capability_label(agent)}: agent '{agent.name}'")
         # Unknown CLI posture is FAIL in every mode -- say so and fail closed.
@@ -2258,7 +2378,7 @@ def main():
     signal.signal(signal.SIGINT, on_signal)
     deadline = workspace_timeout(cfg, mode) if mode != "safe" else 0
     listen_forever(agent, voice, wake_path, wake_key, listen, log_text,
-                   mode, deadline)
+                   mode, deadline, stt)
     return 0
 
 

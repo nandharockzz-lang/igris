@@ -82,6 +82,33 @@ cooldown       = 1.0   # ignore the wake word this long after replying
 
 
 # ---------------------------------------------------------------------------
+# Speech recognition ([stt]). Jarvis transcribes through voxtype, but with
+# its own pinned engine/model/vocabulary: at startup the daemon writes a
+# jarvis-owned voxtype config under the runtime dir, so your push-to-talk
+# keeps whatever model you chose there.
+#
+# Round-1 benchmark on this machine (14 spoken commands, tools/stt-bench.py):
+# base.en and small.en tie on accuracy (WER 0.058) while base.en answers in
+# ~1.4s vs ~9.1s. Bigger is not better here; re-run the bench after the
+# recorded-mic round or before switching.
+#
+# cloud_fallback stays false unless you opt in: a fallback engine sends the
+# command audio to someone else's server, and only an empty local transcript
+# triggers it -- never a low-confidence one. The fallback runs through your
+# own voxtype config (your keys), never the jarvis-owned one.
+# ---------------------------------------------------------------------------
+[stt]
+engine = "whisper"   # whisper today; parakeet once voxtype ships an ONNX build
+model = "base.en"    # whisper: tiny|tiny.en|base|base.en|small|small.en|...
+language = "en"
+# Short command-vocabulary bias (whisper initial prompt): broker verbs and
+# app nouns, not sentences. 500 chars max.
+vocabulary = "jarvis firefox terminal workspace volume brightness screenshot"
+cloud_fallback = false
+fallback_engine = "soniox"
+
+
+# ---------------------------------------------------------------------------
 # Agents
 #
 # `command` is argv, never a shell string. These placeholders are substituted
