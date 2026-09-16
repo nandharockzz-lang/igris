@@ -1,0 +1,14 @@
+open firefox
+switch to workspace three
+turn the volume up
+mute the microphone
+pause the music
+set brightness to seventy percent
+lock the screen
+take a screenshot
+close the current window
+move this window to workspace two
+open the terminal
+what time is it
+remind me to drink water
+go to the next workspace
