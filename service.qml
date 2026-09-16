@@ -116,8 +116,13 @@ Item {
   }
 
   Connections {
+    enabled: draggableAvatarLoader.item !== null
     target: draggableAvatarLoader.item
     function onPeekRequested() { root.peekCard() }
+    function onPeekKept() { root.keepPeek() }
+    function onPlaybackToggleRequested() { root.togglePlayback() }
+    function onMediaLinkRequested() { root.openMediaLink() }
+    function onPendingAnswered(ok) { root.answerPending(ok) }
   }
 
   function syncAvatarProps() {
@@ -138,6 +143,14 @@ Item {
       if ("hasMedia" in a) a.hasMedia = root.hasMedia
       if ("mediaTitle" in a) a.mediaTitle = root.mediaTitle
       if ("mediaArtist" in a) a.mediaArtist = root.mediaArtist
+      if ("mediaUrl" in a) a.mediaUrl = root.mediaUrl
+      if ("mediaPlaying" in a)
+        a.mediaPlaying = !!(root.activePlayer && root.activePlayer.isPlaying)
+      if ("listening" in a) a.listening = root.listening
+      if ("micBars" in a) a.micBars = root.micBars
+      if ("pendingActive" in a) a.pendingActive = root.pendingActive
+      if ("pendingText" in a) a.pendingText = root.pendingText
+      if ("cardOpen" in a) a.cardOpen = root.consoleVisible
       if ("avatarVisible" in a) a.avatarVisible = !root.active && root.avatarEnabled
     } catch (e) {}
   }
@@ -149,6 +162,8 @@ Item {
   onRequestTextChanged: root.syncAvatarProps()
   onResponseTextChanged: root.syncAvatarProps()
   onHasMediaChanged: root.syncAvatarProps()
+  onMediaUrlChanged: root.syncAvatarProps()
+  onMediaTitleChanged: root.syncAvatarProps()
 
   readonly property bool armed: root.serviceState === "active"
   readonly property bool failed: root.serviceState === "failed"
@@ -157,13 +172,22 @@ Item {
   readonly property bool hasText: root.requestText !== "" || root.responseText !== ""
   readonly property var mprisPlayers: Mpris.players ? Mpris.players.values : []
   readonly property var activePlayer: root.selectActivePlayer()
-  // selectActivePlayer() only returns an actually-playing player, so
-  // hasMedia is false when paused — and it never opens the card alone.
+  // Playing first, then a paused player that still has a track. Pause must
+  // not hide the mini player; hasMedia still never opens the card alone.
   readonly property bool hasMedia: !!root.activePlayer
   readonly property string mediaTitle: root.activePlayer
     ? (root.activePlayer.trackTitle || root.activePlayer.identity || "Media") : ""
   readonly property string mediaArtist: root.activePlayer
     ? (root.activePlayer.trackArtist || "") : ""
+  readonly property string mediaUrl: {
+    var p = root.activePlayer
+    if (!p) return ""
+    var md = p.metadata || {}
+    var u = ""
+    try { u = String(md["xesam:url"] || md["xesam:Url"] || "") } catch (e) { u = "" }
+    if (u.indexOf("http://") === 0 || u.indexOf("https://") === 0) return u
+    return ""
+  }
   readonly property string modeName: {
     if (root.mode === "privileged") return "FULL"
     if (root.mode === "workspace") return "BASIC"
@@ -211,11 +235,15 @@ Item {
 
   function selectActivePlayer() {
     var list = root.mprisPlayers || []
+    var paused = null
     for (var i = 0; i < list.length; i++) {
       var p = list[i]
-      if (p && p.isPlaying) return p
+      if (!p) continue
+      if (p.isPlaying) return p
+      if (!paused && (p.trackTitle || p.trackArtist || p.identity))
+        paused = p
     }
-    return null
+    return paused
   }
 
   function refreshWakeFresh() {
@@ -244,6 +272,9 @@ Item {
   }
 
   onActiveChanged: root.syncAvatarProps()
+  onConsoleVisibleChanged: root.syncAvatarProps()
+  onPendingActiveChanged: root.syncAvatarProps()
+  onMicBarsChanged: root.syncAvatarProps()
 
   function refreshExpanded() {
     root.expanded = root.active
@@ -286,6 +317,18 @@ Item {
       console.log("[jarvis] play/pause failed: " + e)
     }
     root.keepPeek()
+  }
+
+  function openMediaLink() {
+    root.keepPeek()
+    // Broker reads MPRIS xesam:url and opens Chromium. QML metadata keys
+    // are not a reliable source for the YouTube link.
+    openMediaProc.command = [root.brokerBin, "media-link"]
+    openMediaProc.running = true
+  }
+
+  Process {
+    id: openMediaProc
   }
 
   Process {
@@ -405,359 +448,5 @@ Item {
     id: stopProc
     command: ["systemctl", "--user", "stop", "jarvis"]
     onExited: { root.busy = false; root.refresh() }
-  }
-
-  // Delayed hide so the card's fade-out animation can play instead
-  // of being cut off the moment active flips false.
-  Timer {
-    id: cardHideTimer
-    interval: 240
-    repeat: false
-  }
-
-  onConsoleVisibleChanged: {
-    if (!root.consoleVisible) cardHideTimer.restart()
-    else cardHideTimer.stop()
-  }
-
-  // Dedicated card surface: a small top-right window sized to the card,
-  // not a fullscreen transparent sheet. The window unmaps with the card
-  // (visible follows it), and the mask limits input to the card rect, so
-  // the click region always exactly matches the visible card -- never a
-  // stale fullscreen region, never an invisible catcher.
-  PanelWindow {
-    id: overlay
-    visible: card.visible
-    screen: Quickshell.screens && Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
-    anchors { top: true; right: true }
-    implicitWidth: card.width + 18
-    implicitHeight: card.height + 18
-    color: "transparent"
-    WlrLayershell.namespace: "dorian-voice-console"
-    WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
-    exclusionMode: ExclusionMode.Ignore
-
-    mask: Region {
-      Region { item: card }
-    }
-
-    Rectangle {
-      id: card
-      // Idle is the draggable avatar (separate window). This card exists
-      // only while voice-active, so it is always the full 360px layout.
-      // It stays mapped through the fade-out so hide animates smoothly.
-      visible: root.consoleVisible || cardHideTimer.running
-      opacity: root.consoleVisible ? 1 : 0
-      anchors.top: parent.top
-      anchors.right: parent.right
-      anchors.topMargin: 18
-      anchors.rightMargin: 18
-      width: 360
-      height: contentColumn.implicitHeight + 28
-      radius: 18
-      color: Qt.rgba(0.04, 0.055, 0.09, 0.96)
-      border.width: 1
-      border.color: Qt.rgba(root.modeColor.r, root.modeColor.g, root.modeColor.b, 0.65)
-
-      Behavior on opacity { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
-
-      // Hide animation stays inside the window: fade plus a slight rise.
-      // (A slide off-screen would clip on the dedicated surface and drag
-      // the input mask away from the fading card.)
-      transform: Translate {
-        y: root.consoleVisible ? 0 : -10
-        Behavior on y {
-          NumberAnimation { duration: 240; easing.type: Easing.OutCubic }
-        }
-      }
-
-      // NOTE: no Behavior on width/height here on purpose. The height is
-      // bound to the content's implicit height, and animating it raced the
-      // layershell input mask: the button rendered before its click region
-      // existed, so clicks visibly landed on a dead button.
-
-      // Card background catcher, beneath every control: any press inside
-      // the card extends a peek so it can't vanish mid-interaction, and
-      // the opaque card owns its clicks instead of leaking them through.
-      MouseArea {
-        id: cardMouse
-        anchors.fill: parent
-        acceptedButtons: Qt.LeftButton | Qt.RightButton
-        onPressed: root.keepPeek()
-        onClicked: root.keepPeek()
-      }
-
-      Column {
-        id: contentColumn
-        visible: true
-        anchors.fill: parent
-        anchors.margins: 14
-        spacing: 9
-
-        Row {
-          width: parent.width
-          spacing: 10
-
-          Item {
-            id: miniAvatarWrap
-            width: 76
-            height: 76
-            // Press feedback mirroring the play button, so a click visibly
-            // registers even before the daemon state round-trips back.
-            scale: avatarMouse.pressed ? 0.92 : 1.0
-            Behavior on scale { NumberAnimation { duration: 90 } }
-
-            GokuAvatar {
-              anchors.centerIn: parent
-              side: 76
-              state: root.avatarState
-              mode: root.mode
-              level: root.voiceLevel
-              blink: false
-              bob: 0
-              reduceMotion: false
-              highContrast: false
-            }
-
-            // Left steps Basic/Full, right disarms. Explicit buttons,
-            // hover and cursor: this is a control, not decoration.
-            MouseArea {
-              id: avatarMouse
-              anchors.fill: parent
-              acceptedButtons: Qt.LeftButton | Qt.RightButton
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: function(mouse) {
-                root.keepPeek()
-                if (mouse.button === Qt.RightButton) root.disarm()
-                else root.toggleMode()
-              }
-            }
-          }
-
-          Column {
-            visible: true
-            width: parent.width - 86
-            spacing: 3
-            anchors.verticalCenter: parent.verticalCenter
-
-            Text {
-              text: "JARVIS"
-              color: root.modeColor
-              font.bold: true
-              font.pixelSize: 12
-              font.letterSpacing: 2
-            }
-            Text {
-              text: root.statusText
-              color: "#e6edf3"
-              font.pixelSize: 13
-              elide: Text.ElideRight
-              width: parent.width
-            }
-            Text {
-              text: "SUPER+SHIFT+J  ·  toggle mode"
-              color: "#8b949e"
-              font.pixelSize: 9
-              elide: Text.ElideRight
-              width: parent.width
-            }
-          }
-
-        }
-
-        EqBars {
-          visible: root.listening
-          width: parent.width
-          bars: root.micBars
-          active: root.listening
-          reduceMotion: false
-          highContrast: false
-          foreground: "#8b949e"
-          accent: root.modeColor
-          maxHeight: 28
-          barWidth: 5
-        }
-
-        Column {
-          visible: root.hasText
-          width: parent.width
-          spacing: 5
-
-          Text {
-            visible: root.requestText !== ""
-            text: root.requestText
-            color: "#8b949e"
-            font.pixelSize: 11
-            elide: Text.ElideRight
-            width: parent.width
-          }
-          Text {
-            visible: root.responseText !== ""
-            text: root.responseText
-            color: "#f0f6fc"
-            font.pixelSize: 13
-            wrapMode: Text.WordWrap
-            width: parent.width
-            maximumLineCount: 6
-            elide: Text.ElideRight
-          }
-        }
-
-        // On-screen confirmation for staged destructive actions. Confirm
-        // runs `jarvis-open confirm` (the tap IS the authorization); Deny
-        // drops it. Nothing here runs anything else.
-        Rectangle {
-          visible: root.pendingActive
-          width: parent.width
-          height: pendingColumn.implicitHeight + 18
-          radius: 10
-          color: Qt.rgba(0.95, 0.55, 0.20, 0.14)
-          border.width: 1
-          border.color: "#f0883e"
-
-          Column {
-            id: pendingColumn
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.margins: 9
-            spacing: 8
-
-            Text {
-              text: "Confirm action"
-              color: "#f0883e"
-              font.bold: true
-              font.pixelSize: 11
-              font.letterSpacing: 1.5
-              width: parent.width
-            }
-            Text {
-              text: root.pendingText
-              color: "#f0f6fc"
-              font.pixelSize: 13
-              wrapMode: Text.WordWrap
-              width: parent.width
-            }
-            Row {
-              width: parent.width
-              spacing: 8
-
-              Rectangle {
-                id: confirmButton
-                width: (parent.width - 8) / 2
-                height: 34
-                radius: 8
-                color: "#3fb950"
-                scale: confirmMouse.pressed ? 0.94 : 1.0
-                Behavior on scale { NumberAnimation { duration: 90 } }
-                Text {
-                  anchors.centerIn: parent
-                  text: "Confirm"
-                  color: "#081018"
-                  font.bold: true
-                  font.pixelSize: 13
-                }
-                MouseArea {
-                  id: confirmMouse
-                  anchors.fill: parent
-                  acceptedButtons: Qt.LeftButton
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: { root.keepPeek(); root.answerPending(true) }
-                }
-              }
-
-              Rectangle {
-                id: denyButton
-                width: parent.width - confirmButton.width - 8
-                height: 34
-                radius: 8
-                color: Qt.rgba(1, 1, 1, 0.12)
-                border.width: 1
-                border.color: "#8b949e"
-                scale: denyMouse.pressed ? 0.94 : 1.0
-                Behavior on scale { NumberAnimation { duration: 90 } }
-                Text {
-                  anchors.centerIn: parent
-                  text: "Deny"
-                  color: "#f0f6fc"
-                  font.pixelSize: 13
-                }
-                MouseArea {
-                  id: denyMouse
-                  anchors.fill: parent
-                  acceptedButtons: Qt.LeftButton
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: { root.keepPeek(); root.answerPending(false) }
-                }
-              }
-            }
-          }
-        }
-
-        Rectangle {
-          visible: root.hasMedia
-          width: parent.width
-          height: 46
-          radius: 10
-          color: Qt.rgba(1, 1, 1, 0.07)
-
-          Column {
-            anchors.left: parent.left
-            anchors.leftMargin: 10
-            anchors.verticalCenter: parent.verticalCenter
-            width: parent.width - 54
-            spacing: 2
-            Text {
-              text: root.mediaTitle
-              color: "#f0f6fc"
-              font.pixelSize: 11
-              elide: Text.ElideRight
-              width: parent.width
-            }
-            Text {
-              text: root.mediaArtist
-              color: "#8b949e"
-              font.pixelSize: 10
-              elide: Text.ElideRight
-              width: parent.width
-            }
-          }
-
-          Rectangle {
-            id: playButton
-            anchors.right: parent.right
-            anchors.rightMargin: 8
-            anchors.verticalCenter: parent.verticalCenter
-            width: 44
-            height: 36
-            radius: 8
-            z: 2
-            color: root.modeColor
-            // Shrink while held so a click visibly registers even before
-            // the player state round-trips back.
-            scale: playMouse.pressed ? 0.9 : 1.0
-            Behavior on scale { NumberAnimation { duration: 90 } }
-            Text {
-              anchors.centerIn: parent
-              text: root.activePlayer && root.activePlayer.isPlaying ? "󰏤" : "󰐊"
-              color: "#081018"
-              font.pixelSize: 16
-            }
-            MouseArea {
-              id: playMouse
-              anchors.fill: parent
-              acceptedButtons: Qt.LeftButton
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.togglePlayback()
-            }
-          }
-        }
-      }
-    }
   }
 }

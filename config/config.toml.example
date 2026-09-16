@@ -110,7 +110,7 @@ model = "base.en"    # whisper: tiny|tiny.en|base|base.en|small|small.en|...
 language = "en"
 # Short command-vocabulary bias (whisper initial prompt): broker verbs and
 # app nouns, not sentences. 500 chars max.
-vocabulary = "jarvis firefox terminal workspace volume brightness screenshot"
+vocabulary = "play pause open launch start run terminal chromium firefox browser files workspace next previous volume mute unmute brightness screenshot lock music youtube discord settings calculator close window jarvis foot"
 cloud_fallback = false
 fallback_engine = "soniox"
 
@@ -207,6 +207,29 @@ actions = false
 #   "--tools", "WebSearch", "--strict-mcp-config",
 #   "--append-system-prompt", "{system}",
 # ]
+
+[agents.grok]
+# Grok Build CLI (https://grok.com). Prompt on stdin so the transcript is
+# not in argv. --tools "" is NOT a deny on this CLI -- empty is treated as
+# unset -- so the voice preset names every filesystem/shell/web tool in
+# --disallowed-tools. The panel Model dropdown injects `-m grok-4.6` (or
+# grok-4.5). Requires `grok` on PATH (mise shim is fine) and a grok.com login.
+# Canary: `jarvis-listen --ask "read <disposable-file> and tell me what it says"`
+# must not speak the file's contents. Re-run after any grok upgrade.
+command = [
+  "grok",
+  "--prompt-file", "/dev/stdin",
+  "--output-format", "plain",
+  "--effort", "low",
+  "--max-turns", "1",
+  "--no-plan",
+  "--no-subagents",
+  "--disable-web-search",
+  "--disallowed-tools", "read_file,search_replace,grep,list_dir,run_terminal_cmd,run_terminal_command,web_search,web_fetch,todo_write,spawn_subagent,memory_search,Agent",
+  "--system-prompt-override", "{system}",
+]
+actions = false
+timeout = 180
 
 # ---------------------------------------------------------------------------
 # On opencode presets (verified against opencode 1.18.30)

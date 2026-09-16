@@ -709,7 +709,7 @@ Dropdown {
                 width: parent.width
                 label: "Model"
                 value: root.model
-                enabled: root.loaded && root.agent === "opencode-voice"
+                enabled: root.loaded && (root.agent === "opencode-voice" || root.agent === "grok")
                 foreground: root.fg
                 accent: root.accent
                 fontFamily: root.fontFamily
@@ -730,9 +730,11 @@ Dropdown {
               }
 
              Text {
-               text: root.agent === "opencode-voice"
+               text: root.agent === "grok"
+                     ? "Grok 4.6 is the current flagship. Requires the grok CLI (logged in at grok.com)."
+                     : root.agent === "opencode-voice"
                      ? "Select the OpenCode model to use. Switch to a different free model when the current one is exhausted."
-                     : "Model selection is only available for the OpenCode agent."
+                     : "Model selection is available for the OpenCode and Grok agents."
                visible: text !== ""
                color: Qt.darker(root.fg, 1.4)
                font.family: root.fontFamily

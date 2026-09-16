@@ -241,6 +241,20 @@ class PostureTests(unittest.TestCase):
         argv = ["opencode", "run", "--agent", "no-such-agent"]
         self.assertEqual(jl.tool_posture("opencode", argv), jl.TOOLS_UNKNOWN)
 
+    def test_grok_full_denylist_verifies(self):
+        argv = ["grok", "--disallowed-tools",
+                ",".join(jl.GROK_DISALLOWED_TOOLS)]
+        self.assertEqual(jl.tool_posture("grok", argv), jl.TOOLS_DENIED)
+
+    def test_grok_empty_tools_not_verified(self):
+        argv = ["grok", "--tools", ""]
+        self.assertEqual(jl.tool_posture("grok", argv), jl.TOOLS_UNKNOWN)
+
+    def test_grok_missing_read_file_fails_closed(self):
+        tools = [t for t in jl.GROK_DISALLOWED_TOOLS if t != "read_file"]
+        argv = ["grok", "--disallowed-tools", ",".join(tools)]
+        self.assertEqual(jl.tool_posture("grok", argv), jl.TOOLS_UNKNOWN)
+
     def test_real_voice_agent_denied(self):
         # Effective behavior of THIS machine's agent file, not TOML syntax.
         argv = ["opencode", "run", "--agent", "jarvis-voice",
@@ -494,6 +508,34 @@ class MediaBrokerTests(unittest.TestCase):
         global jo
         jo = importlib.util.module_from_spec(spec)
         loader.exec_module(jo)
+
+    def test_media_link_opens_chromium(self):
+        opened = []
+        meta = ('a{sv} 2 "xesam:title" s "Song" '
+                '"xesam:url" s "https://www.youtube.com/watch?v=abcdefghijk"')
+        real_run, real_spawn, real_have, real_players = (
+            jo.run_cmd, jo.spawn, jo.have, jo.mpris_players)
+        jo.mpris_players = lambda: ["org.mpris.MediaPlayer2.mpv"]
+        jo.run_cmd = lambda argv, timeout=10, out_limit=500: (0, meta)
+        jo.spawn = lambda argv: opened.append(argv)
+        jo.have = lambda c: c in ("uwsm", "chromium")
+        try:
+            self.assertEqual(jo.cmd_media_link(), 0)
+        finally:
+            jo.run_cmd, jo.spawn, jo.have, jo.mpris_players = (
+                real_run, real_spawn, real_have, real_players)
+        self.assertEqual(opened[0][:4],
+                         ["uwsm", "app", "--", "chromium"])
+        self.assertEqual(
+            opened[0][4], "https://www.youtube.com/watch?v=abcdefghijk")
+
+    def test_media_link_no_player(self):
+        real_players = jo.mpris_players
+        jo.mpris_players = lambda: []
+        try:
+            self.assertEqual(jo.cmd_media_link(), 1)
+        finally:
+            jo.mpris_players = real_players
 
     def test_bad_values_refused(self):
         for bad in ("", "play song", "PLAY", "play;evil", "volume"):

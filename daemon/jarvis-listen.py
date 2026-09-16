@@ -71,6 +71,19 @@ PARAKEET_MODELS = ("parakeet-tdt-0.6b-v2", "parakeet-tdt-0.6b-v2-int8",
 VOXTYPE_MODELS_DIR = os.path.join(os.path.expanduser("~"), ".local", "share",
                                   "voxtype", "models")
 
+# Grok Build (grok CLI) --tools "" is NOT an empty allowlist: empty is
+# treated as unset and every built-in stays. The voice preset must name
+# every filesystem/shell/web tool in --disallowed-tools. tool_posture
+# requires this set before it will call the invocation answer-only.
+GROK_DISALLOWED_TOOLS = (
+    "read_file", "search_replace", "grep", "list_dir",
+    "run_terminal_cmd", "run_terminal_command",
+    "web_search", "web_fetch", "todo_write",
+    "spawn_subagent", "memory_search", "Agent",
+)
+GROK_DISALLOWED_TOOLS_ARG = ",".join(GROK_DISALLOWED_TOOLS)
+GROK_DEFAULT_MODEL = "grok-4.6"
+
 DEFAULTS = {
     "agent": "claude",
     "wake_word": "hey_jarvis",
@@ -111,8 +124,14 @@ DEFAULTS = {
         "model": "base.en",
         "language": "en",
         # Command-vocabulary bias for whisper's initial prompt. Short nouns
-        # and verbs from the broker grammar, not sentences.
-        "vocabulary": "jarvis firefox terminal workspace volume brightness screenshot",
+        # and verbs from the broker grammar, not sentences. Whisper otherwise
+        # prefers common English ("player") over command English ("play").
+        "vocabulary": (
+            "play pause open launch start run terminal chromium firefox "
+            "browser files workspace next previous volume mute unmute "
+            "brightness screenshot lock music youtube discord settings "
+            "calculator close window jarvis foot"
+        ),
         # Opt-in cloud fallback for empty local transcripts. Off by
         # default: local-first, and a cloud engine sends audio off-machine.
         "cloud_fallback": False,
@@ -146,6 +165,27 @@ DEFAULTS = {
             # back should never quietly grant more than was granted before.
             "actions": False,
         },
+        # Grok Build CLI. Prompt on stdin via --prompt-file /dev/stdin so
+        # the transcript is not in argv. --tools "" is NOT a deny on this
+        # CLI (empty is treated as unset); --disallowed-tools must name
+        # every filesystem/shell/web tool. Canary: a disposable file's
+        # contents must not come back from --ask. Re-run after upgrades.
+        "grok": {
+            "command": [
+                "grok",
+                "--prompt-file", "/dev/stdin",
+                "--output-format", "plain",
+                "--effort", "low",
+                "--max-turns", "1",
+                "--no-plan",
+                "--no-subagents",
+                "--disable-web-search",
+                "--disallowed-tools", GROK_DISALLOWED_TOOLS_ARG,
+                "--system-prompt-override", "{system}",
+            ],
+            "actions": False,
+            "timeout": 180,
+        },
     },
 }
 
@@ -164,7 +204,10 @@ STYLE_PROMPT = (
 NO_TOOLS_PROMPT = (
     "You have no tools in this conversation. You cannot read or write files, "
     "run commands, or browse. If answering would need one, say so in a short "
-    "spoken sentence. Never write out a tool call or any other markup."
+    "spoken sentence. Never write out a tool call (no XML tags, no "
+    "function-call JSON). A <<jarvis:...>> line at the end of your reply is "
+    "how you ask Jarvis to act -- that is not a tool call, and it is not "
+    "markup to skip."
 )
 
 # The actions half. Only sent to agents configured with actions = true. The
@@ -198,8 +241,9 @@ ACTIONS_PROMPT = (
     "notification. Destructive verbs exist but need the user's on-screen "
     "tap before they run: <<jarvis:close-window>>, <<jarvis:logout>>, "
     "<<jarvis:reboot>>, <<jarvis:poweroff>>, <<jarvis:wifi on|off>>. "
-    "Emit at most one directive line and say in your reply what it does; "
-    "if the user must confirm, say that too. "
+    "Emit one directive line per action (compound requests may use more "
+    "than one) and say in your reply what they do; if the user must "
+    "confirm, say that too. "
     "You cannot browse results, click anything, or control a page: say "
     "so out loud if asked. "
     "The line is stripped before your reply is spoken, "
@@ -632,7 +676,7 @@ def grants_tools(argv):
 # invocation is tool-free we have to know which flag removes the tools and
 # what its absence implies, and that is per-CLI knowledge. We have it for
 # Claude Code (argv flags) and for opencode (agent-file frontmatter, below).
-KNOWN_CLIS = ("claude", "opencode")
+KNOWN_CLIS = ("claude", "opencode", "grok")
 
 TOOLS_DENIED = "denied"      # verified tool-free
 TOOLS_GRANTED = "granted"    # verified to hand the CLI tools
@@ -737,6 +781,11 @@ def tool_posture(executable, argv):
         if name and opencode_frontmatter_denies(name):
             return TOOLS_DENIED
         return TOOLS_UNKNOWN
+    if os.path.basename(executable) == "grok":
+        # Grok Build: --tools "" is unset (all tools stay). Answer-only
+        # requires --disallowed-tools to name every filesystem/shell/web
+        # tool. Verified against grok 1.0.30 with a disposable-file canary.
+        return TOOLS_DENIED if grok_tools_denied(argv) else TOOLS_UNKNOWN
     # Claude Code: tool-free requires *both* the empty built-in allowlist and
     # a strict MCP config with nothing to load, or the user's own MCP servers
     # come back. Bare `claude -p` is not answer-only.
@@ -750,6 +799,22 @@ def tool_posture(executable, argv):
         for part in argv
     )
     return TOOLS_DENIED if (empty_tools and strict_mcp) else TOOLS_UNKNOWN
+
+
+def grok_tools_denied(argv):
+    """True only if argv names every required Grok tool in --disallowed-tools."""
+    denied = set()
+    for i, part in enumerate(argv):
+        raw = ""
+        if part == "--disallowed-tools" and i + 1 < len(argv):
+            raw = argv[i + 1]
+        elif part.startswith("--disallowed-tools="):
+            raw = part.split("=", 1)[1]
+        else:
+            continue
+        denied.update(t.strip() for t in raw.split(",") if t.strip())
+    required = set(GROK_DISALLOWED_TOOLS) - {"run_terminal_command"}
+    return required <= denied
 
 
 def capability_label(agent):
@@ -784,6 +849,25 @@ def _model_listed(model_id, timeout=15):
     return any(line.strip() == model_id for line in proc.stdout.splitlines())
 
 
+def inject_model_flag(template, model_setting, after_flag=None):
+    """Insert or replace -m/--model in an argv template (mutates in place)."""
+    for flag in ("-m", "--model"):
+        if flag in template:
+            idx = template.index(flag)
+            if idx + 1 < len(template):
+                template[idx + 1] = model_setting
+            else:
+                template.append(model_setting)
+            return
+    if after_flag and after_flag in template:
+        idx = template.index(after_flag)
+        template.insert(idx + 2, "-m")
+        template.insert(idx + 3, model_setting)
+        return
+    template.insert(1, "-m")
+    template.insert(2, model_setting)
+
+
 def select_agent(cfg):
     """Resolve cfg['agent'] to an Agent, failing loudly on a bad name."""
     name = cfg.get("agent", "claude")
@@ -796,35 +880,27 @@ def select_agent(cfg):
     except ValueError as exc:
         # A clean message, not a traceback, for systemd's restart loop to log.
         raise SystemExit(f"[jarvis] {exc}")
-    # The top-level `model` key selects the OpenCode model for opencode-voice
-    # (the panel Model dropdown writes it). Injected here so config and daemon
-    # agree without the panel having to know agent argv shapes.
-    if name == "opencode-voice":
+    # The top-level `model` key is injected as `-m` for agents that take it
+    # (opencode-voice, grok). The panel Model dropdown writes that key.
+    if name in ("opencode-voice", "grok"):
         model_setting = cfg.get("model")
+        if name == "grok" and (
+                not model_setting or not str(model_setting).startswith("grok-")):
+            model_setting = GROK_DEFAULT_MODEL
         if not model_setting:
-            log("warning: no model configured for opencode-voice; "
-                "pick one in the panel")
+            log(f"warning: no model configured for {name}; pick one in the panel")
         else:
+            after = "--agent" if name == "opencode-voice" else None
             for label, template in (("command", agent.command),
                                     ("web_command", agent.web_command or [])):
                 if not template:
                     continue
-                try:
-                    idx = template.index("--agent")
-                except ValueError:
-                    log(f"warning: agent '{name}' {label} has no '--agent'; "
+                if after and after not in template:
+                    log(f"warning: agent '{name}' {label} has no '{after}'; "
                         "cannot inject the configured model there")
                     continue
-                if len(template) < idx + 2:
-                    log(f"warning: agent '{name}' {label} has no agent name "
-                        "after '--agent'; cannot inject the configured model")
-                    continue
-                template.insert(idx + 2, "-m")
-                template.insert(idx + 3, model_setting)
-            # Advisory only: hard validation lives in `jarvis-config set
-            # model` behind the panel. A hiccup in `opencode models` must
-            # never kill the mic, so an unaskable probe stays silent.
-            if _model_listed(model_setting) is False:
+                inject_model_flag(template, model_setting, after_flag=after)
+            if name == "opencode-voice" and _model_listed(model_setting) is False:
                 log(f"warning: configured model '{model_setting}' is not "
                     "listed by `opencode models`; continuing anyway")
     if shutil.which(agent.executable) is None:
@@ -1644,10 +1720,10 @@ def clean_reply(text, strip_prefixes):
 # --------------------------------------------------------------------------
 
 DIRECTIVE_RE = re.compile(
-    r"^\s*<<jarvis:(open-app|open-url|search|volume|brightness|workspace|mute|media|music|mymusic"
+    r"<<jarvis:(open-app|open-url|search|volume|brightness|workspace|mute|media|music|mymusic"
     r"|focus-window|move-window|fullscreen|lock|screenshot|notify"
     r"|close-window|logout|reboot|poweroff|wifi)"
-    r"(?:\s+([^<>\n]{1,256}?))?\s*>>\s*$")
+    r"(?:\s+([^<>]{1,256}?))?\s*>>")
 _DIRECTIVE_KINDS = {"open-app": "app", "open-url": "url", "search": "search",
                     "volume": "volume", "brightness": "brightness",
                     "workspace": "workspace", "mute": "mute",
@@ -1773,21 +1849,22 @@ def installed_apps():
 def extract_directive(reply):
     """Split a reply into (spoken_text, directive-or-None).
 
-    Directive lines are stripped from the spoken text whether or not actions
-    are enabled -- an ignored directive should not be read aloud either --
-    and only the first one counts.
+    Directives are stripped from spoken/UI text whether or not actions are
+    enabled. Grok often inlines them on the same line as the sentence
+    (`Playing X now. <<jarvis:music ...>>`); those must still count.
+    Only the first valid directive is executed.
     """
     directive = None
-    kept = []
-    for line in reply.splitlines():
-        match = DIRECTIVE_RE.match(line)
-        if match:
-            if directive is None:
-                directive = (_DIRECTIVE_KINDS[match.group(1)],
-                             (match.group(2) or "").strip())
-            continue
-        kept.append(line)
-    return "\n".join(kept).strip(), directive
+    for match in DIRECTIVE_RE.finditer(reply or ""):
+        if directive is None:
+            directive = (_DIRECTIVE_KINDS[match.group(1)],
+                         (match.group(2) or "").strip())
+    spoken = DIRECTIVE_RE.sub("", reply or "")
+    spoken = TAINT_STRIP_RE.sub("", spoken)
+    spoken = re.sub(r"[ \t]{2,}", " ", spoken)
+    spoken = re.sub(r"\n{3,}", "\n\n", spoken).strip(" \t")
+    spoken = "\n".join(line.strip() for line in spoken.splitlines()).strip()
+    return spoken, directive
 
 
 def run_directive(directive, mode="safe", approval_source="voice",
@@ -2191,7 +2268,8 @@ def match_routine_intent(text):
     m = re.match(r"^play (?:my )?playlist\s+([a-z0-9 _.'\-]{1,40})$", t)
     if m:
         return ("mymusic", f"playlist {m.group(1).strip()}")
-    m = re.match(r"^(?:play|put on)\s+(.{1,80})$", t)
+    # "player X" is a common STT of "play a/the X".
+    m = re.match(r"^(?:play|put on|player)\s+(.{1,80})$", t)
     if m:
         query = " ".join(m.group(1).split())
         if MUSIC_QUERY_RE.match(query):
@@ -2234,18 +2312,22 @@ def match_routine_intent(text):
             return None
     if t == "open youtube":
         return ("url", "https://www.youtube.com/")
-    m = re.match(r"^open ([a-z0-9][a-z0-9 ._\-]{0,30})$", t)
+    # Workspaces before generic "open APP": "open workspace 5" is not an app.
+    # Names here are a single token (no spaces) so "go to workspace 5 and
+    # open chromium" cannot be swallowed as a workspace named
+    # "5 and open chromium" -- Hyprland then errors Bad workspace.
+    _ws = r"([a-z0-9][a-z0-9_.-]{0,31})"
+    m = re.match(rf"^(?:switch to|go to|move to|open|show) workspace {_ws}$",
+                 t)
     if m:
+        return ("workspace", m.group(1).strip())
+    m = re.match(rf"^workspace {_ws}$", t)
+    if m:
+        return ("workspace", m.group(1).strip())
+    m = re.match(r"^(?:open|launch|start|run)(?: the)? "
+                 r"([a-z0-9][a-z0-9 ._\-]{0,30})$", t)
+    if m and not m.group(1).startswith("workspace"):
         return ("app", m.group(1).strip())
-    # Workspaces: number, name, or step. ("switch to X" for apps lives in
-    # the focus rules below, which refuse a leading "workspace".)
-    m = re.match(r"^(?:switch to|go to|open|show) workspace "
-                 r"([a-z0-9][a-z0-9 _.\-]{0,31})$", t)
-    if m:
-        return ("workspace", m.group(1).strip())
-    m = re.match(r"^workspace ([a-z0-9][a-z0-9 _.\-]{0,31})$", t)
-    if m:
-        return ("workspace", m.group(1).strip())
     if re.match(r"^(?:go to |switch to |move to )?(?:the )?"
                 r"(next|previous) workspace$", t):
         which = "next" if "next" in t.split() else "previous"
@@ -2297,6 +2379,31 @@ def match_routine_intent(text):
     return None
 
 
+def match_routine_intents(text):
+    """One or more routine intents when the utterance is only those commands.
+
+    Compound speech ("go to workspace 5 and open chromium") is split on
+    and/then. Every clause must match or this returns None and the model
+    handles the whole sentence. A single-clause match still wins first.
+    """
+    t = _command_words(text)
+    if not t:
+        return None
+    one = match_routine_intent(t)
+    if one is not None:
+        return [one]
+    parts = re.split(r"\s+(?:and then|then|and)\s+", t)
+    if len(parts) < 2 or len(parts) > 4:
+        return None
+    intents = []
+    for part in parts:
+        got = match_routine_intent(part)
+        if got is None:
+            return None
+        intents.append(got)
+    return intents
+
+
 def respond(agent, voice, text, log_text=False, mode="safe",
             approval_source="voice"):
     """Shared tail of the pipeline: ask, then say the answer out loud.
@@ -2313,33 +2420,32 @@ def respond(agent, voice, text, log_text=False, mode="safe",
         # unambiguous, the broker verbs are deterministic, and the LLM would
         # only add latency and failure modes. Same enforcement as the
         # directive path (mode + arm gating inside run_directive); a refusal
-        # or a non-match falls through to the agent below.
-        routine = match_routine_intent(text)
-        if routine is not None:
-            outcome = run_directive(routine, mode, approval_source,
-                                    require_arm=(approval_source == "voice"))
-            if outcome == "pending":
-                # Destructive/security-sensitive on voice authority: staged
-                # for an on-screen tap, nothing ran yet.
-                answer = PENDING_CONFIRM
+        # or a non-match falls through to the agent below. Compound speech
+        # ("workspace 5 and open chromium") runs each matched clause.
+        routines = match_routine_intents(text)
+        if routines:
+            pending = False
+            ok_any = False
+            spoken = []
+            for routine in routines:
+                outcome = run_directive(
+                    routine, mode, approval_source,
+                    require_arm=(approval_source == "voice"))
                 audit({"mode": mode, "transcript_len": len(text),
                        "tool_name": f"broker:{routine[0]}",
                        "args_summary_sanitized": directive_summary(*routine),
                        "approval_source": approval_source,
-                       "result_code": "pending-confirm"})
-                log("reply: confirmation staged (routine intent, "
-                    "no model call)")
-                publish_ui_text(RESPONSE_FILE, answer)
-                set_state("speaking")
-                speak(answer, voice)
-                return answer
-            if outcome:
-                answer = ROUTINE_CONFIRM.get(routine[0], "Doing it now.")
-                audit({"mode": mode, "transcript_len": len(text),
-                       "tool_name": f"broker:{routine[0]}",
-                       "args_summary_sanitized": directive_summary(*routine),
-                       "approval_source": approval_source,
-                       "result_code": "ok-intent"})
+                       "result_code": ("pending-confirm" if outcome == "pending"
+                                       else "ok-intent" if outcome else "refused")})
+                if outcome == "pending":
+                    pending = True
+                    spoken.append(PENDING_CONFIRM)
+                elif outcome:
+                    ok_any = True
+                    spoken.append(ROUTINE_CONFIRM.get(routine[0],
+                                                      "Doing it now."))
+            if pending or ok_any:
+                answer = " ".join(spoken) if spoken else "Doing it now."
                 log(f"reply: {len(answer)} characters (routine intent, "
                     "no model call)")
                 publish_ui_text(RESPONSE_FILE, answer)

@@ -47,7 +47,7 @@ WRITABLE = {
     "mode":                   "str",
     "wake_word":              "str",
     "voice":                  "str",
-    "model":                  "str",  # Top-level model setting for OpenCode agent
+    "model":                  "str",  # Top-level model for OpenCode / Grok agents
     "draggable_avatar_enabled": "bool",
     "listen.wake_threshold":  "float",
     "listen.silence_tail":    "float",
@@ -148,14 +148,13 @@ def validate(daemon, key, value, config_path):
         if not os.path.exists(path):
             raise SystemExit(f"no such voice file: {path}")
     if key == "model":
-        # Validate that the model is available in OpenCode
         if not value:
             raise SystemExit("model setting cannot be empty")
-        available = get_available_models()
+        cfg = daemon.load_config(config_path)
+        available = get_available_models(agent=cfg.get("agent"))
         model_ids = [m["id"] for m in available]
         if value not in model_ids:
-            # Show available models in error message
-            available_list = ", ".join(model_ids[:5])  # Show first 5
+            available_list = ", ".join(model_ids[:5])
             if len(model_ids) > 5:
                 available_list += f" (and {len(model_ids) - 5} more)"
             raise SystemExit(f"model '{value}' not available. Available: {available_list}")
@@ -431,7 +430,7 @@ def cmd_show(daemon, args):
         "stt": stt,
         "agents": agents,
         "voices": voice_list(),
-        "available_models": get_available_models(),  # Add available OpenCode models
+        "available_models": get_available_models(agent=cfg.get("agent")),
     }, indent=2))
     return 0
 
@@ -537,38 +536,94 @@ def opencode_models_list():
         return []
 
 
-# Cache for OpenCode models to avoid frequent calls
+# Cache for model lists to avoid frequent CLI calls
 _opencode_models_cache = {"timestamp": 0, "models": []}
+_grok_models_cache = {"timestamp": 0, "models": []}
 MODEL_CACHE_DURATION = 3600  # 1 hour in seconds
 
+GROK_FALLBACK_MODELS = (
+    {"id": "grok-4.6", "name": "Grok 4.6"},
+    {"id": "grok-4.5", "name": "Grok 4.5"},
+)
 
-def get_available_models(force_refresh=False):
-    """Get available OpenCode models with caching."""
+
+def _which_grok():
+    import shutil
+    return shutil.which("grok") or os.path.expanduser(
+        "~/.local/share/mise/shims/grok")
+
+
+def grok_models_list():
+    """Models the grok CLI reports, plus a pinned fallback if it cannot."""
+    import re
+    import subprocess
+    models = []
+    grok = _which_grok()
+    if grok and os.access(grok, os.X_OK):
+        try:
+            proc = subprocess.run(
+                [grok, "models"], capture_output=True, text=True, timeout=20)
+        except (subprocess.TimeoutExpired, OSError):
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            seen = set()
+            for line in proc.stdout.splitlines():
+                match = re.search(r"\b(grok-[\w.]+)\b", line)
+                if not match:
+                    continue
+                mid = match.group(1)
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                name = mid.replace("-", " ")
+                if "default" in line.lower():
+                    name += " (default)"
+                models.append({"id": mid, "name": name})
+    if not models:
+        models = [dict(m) for m in GROK_FALLBACK_MODELS]
+    else:
+        known = {m["id"] for m in models}
+        for fallback in GROK_FALLBACK_MODELS:
+            if fallback["id"] not in known:
+                models.append(dict(fallback))
+    return models
+
+
+def get_available_models(force_refresh=False, agent=None):
+    """Models the panel may offer for the current (or given) agent."""
     import time
-    
+
     now = time.time()
-    if not force_refresh and now - _opencode_models_cache["timestamp"] < MODEL_CACHE_DURATION:
-        return _opencode_models_cache["models"]
-    
-    # Refresh cache
-    models = opencode_models_list()
-    _opencode_models_cache["timestamp"] = now
-    _opencode_models_cache["models"] = models
+    if agent == "grok":
+        cache = _grok_models_cache
+        loader = grok_models_list
+    else:
+        cache = _opencode_models_cache
+        loader = opencode_models_list
+        if agent not in (None, "", "opencode-voice"):
+            return []
+    if not force_refresh and now - cache["timestamp"] < MODEL_CACHE_DURATION:
+        return cache["models"]
+    models = loader()
+    cache["timestamp"] = now
+    cache["models"] = models
     return models
 
 
 def cmd_models(daemon, args):
-    """List available OpenCode models."""
-    provider = args.provider if hasattr(args, 'provider') and args.provider else None
-    
-    if provider and provider != "opencode":
-        print(f"Error: Only 'opencode' provider is supported")
+    """List available models for the current agent (or --provider)."""
+    provider = args.provider if hasattr(args, "provider") and args.provider else None
+    cfg = daemon.load_config(args.config)
+    agent = provider or cfg.get("agent")
+    if provider and provider not in ("opencode", "opencode-voice", "grok"):
+        print("Error: provider must be 'opencode' or 'grok'")
         return 1
-    
-    models = get_available_models()
+    if provider == "opencode":
+        agent = "opencode-voice"
+    models = get_available_models(agent=agent)
     
     if not models:
-        print("No OpenCode models available or opencode not installed")
+        print("No models available for this agent")
         return 1
     
     if hasattr(args, 'format') and args.format == "json":
@@ -957,8 +1012,9 @@ def main():
     iw.add_argument("name")
     iw.add_argument("path")
     # Add models command
-    mpc = sub.add_parser("models", help="list available OpenCode models")
-    mpc.add_argument("provider", nargs="?", help="provider name (only 'opencode' supported)")
+    mpc = sub.add_parser("models", help="list available models for an agent")
+    mpc.add_argument("provider", nargs="?",
+                     help="opencode or grok (default: current agent)")
     mpc.add_argument("--format", choices=["json", "text"], default="text", help="output format")
 
     args = parser.parse_args()

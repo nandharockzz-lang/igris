@@ -56,6 +56,7 @@ if [[ $SRC != "$PLUGIN_DIR" ]]; then
   put 644 "$SRC/ChibiAvatar.qml" "$PLUGIN_DIR/ChibiAvatar.qml"
   put 644 "$SRC/GokuAvatar.qml" "$PLUGIN_DIR/GokuAvatar.qml"
   put 644 "$SRC/DraggableAvatar.qml" "$PLUGIN_DIR/DraggableAvatar.qml"
+  put 644 "$SRC/ConsoleCard.qml" "$PLUGIN_DIR/ConsoleCard.qml"
   put 644 "$SRC/EqBars.qml"    "$PLUGIN_DIR/EqBars.qml"
   # Avatar sprites (user-supplied PNGs; absent files simply fall back to
   # the canvas character, so an empty assets dir deploys fine).

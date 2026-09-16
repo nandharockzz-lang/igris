@@ -263,6 +263,17 @@ class IntentTests(unittest.TestCase):
                          ("music", "some jazz"))
         self.assertEqual(jl.match_routine_intent("put on lofi hip hop"),
                          ("music", "lofi hip hop"))
+        self.assertEqual(
+            jl.match_routine_intent("player dragon bird's theme song"),
+            ("music", "dragon bird's theme song"))
+
+    def test_inline_directive_stripped_and_parsed(self):
+        spoken, directive = jl.extract_directive(
+            "Playing Dragon Bird's theme song on YouTube now. "
+            "<<jarvis:music dragon+bird+theme+song>>")
+        self.assertEqual(directive, ("music", "dragon+bird+theme+song"))
+        self.assertNotIn("jarvis:", spoken)
+        self.assertTrue(spoken.startswith("Playing Dragon Bird"))
         self.assertEqual(jl.match_routine_intent("play my liked songs"),
                          ("mymusic", "liked"))
         self.assertEqual(jl.match_routine_intent("play my watch later"),

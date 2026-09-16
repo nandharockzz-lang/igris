@@ -189,9 +189,15 @@ Everything else lives in `~/.config/jarvis/config.toml`. See
 commented.
 
 ```toml
-agent     = "claude"        # the shipped preset
+agent     = "claude"        # or grok, or opencode-voice
 wake_word = "hey_jarvis"    # or alexa, hey_mycroft, hey_marvin
+model     = "grok-4.6"      # panel Model dropdown; grok and OpenCode agents
 ```
+
+**Grok** uses the Grok Build CLI (`grok` on PATH, logged in at grok.com).
+Pick the `grok` agent in the panel, then Grok 4.6 or 4.5. The voice preset
+denies every filesystem/shell/web tool (`--disallowed-tools`); empty
+`--tools ""` is **not** a deny on this CLI.
 
 Hand-edit it freely: writes from the panel go through `jarvis-config`, which
 rewrites a single line and leaves the rest of the file, comments included,

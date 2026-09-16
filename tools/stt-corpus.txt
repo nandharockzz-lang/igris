@@ -12,3 +12,8 @@ open the terminal
 what time is it
 remind me to drink water
 go to the next workspace
+play dragon bird theme
+open terminal
+go to workspace 5 and open chromium
+open chromium
+play some jazz

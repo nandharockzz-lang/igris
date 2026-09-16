@@ -28,9 +28,17 @@ VENV_PY = os.path.join(JARVIS_DIR, "venv", "bin", "python")
 VOICE = os.path.join(JARVIS_DIR, "voices", "en_US-amy-medium.onnx")
 USER_CONFIG = os.path.join(os.path.expanduser("~"), ".config", "voxtype", "config.toml")
 
+# Same bias Jarvis writes into its owned voxtype config. The bench must
+# use this, not the user's ~/.config/voxtype/config.toml prompt.
+JARVIS_VOCABULARY = (
+    "play pause open launch start run terminal chromium firefox "
+    "browser files workspace next previous volume mute unmute "
+    "brightness screenshot lock music youtube discord settings "
+    "calculator close window jarvis foot"
+)
+
 CANDIDATES = [
     {"name": "whisper-base.en", "engine": "whisper", "model": "base.en"},
-    {"name": "whisper-small.en", "engine": "whisper", "model": "small.en"},
 ]
 
 
@@ -86,10 +94,10 @@ def synthesize():
 
 
 def candidate_config(cand):
-    with open(USER_CONFIG) as f:
-        text = f.read()
-    text = re.sub(r'model\s*=\s*"[^"]*"',
-                  f'model = "{cand["model"]}"', text, count=1)
+    text = (f"[{cand['engine']}]\n"
+            f"model = \"{cand['model']}\"\n"
+            f"language = \"en\"\n"
+            f"initial_prompt = \"{JARVIS_VOCABULARY}\"\n")
     path = os.path.join(WAV_DIR, f"config-{cand['name']}.toml")
     with open(path, "w") as f:
         f.write(text)

@@ -105,6 +105,8 @@ class ParseTests(unittest.TestCase):
     def test_new_verbs_match(self):
         cases = {
             "switch to workspace 3": ("workspace", "3"),
+            "move to workspace 5": ("workspace", "5"),
+            "go to workspace 5": ("workspace", "5"),
             "go to workspace two": ("workspace", "two"),
             "workspace 2": ("workspace", "2"),
             "next workspace": ("workspace", "next"),
@@ -152,6 +154,67 @@ class ParseTests(unittest.TestCase):
                          ("workspace", "2"))
         self.assertEqual(jl.match_routine_intent("switch to firefox"),
                          ("focus-window", "firefox"))
+
+    def test_compound_workspace_and_app(self):
+        self.assertIsNone(jl.match_routine_intent(
+            "go to workspace 5 and open chromium"))
+        self.assertEqual(
+            jl.match_routine_intents("go to workspace 5 and open chromium"),
+            [("workspace", "5"), ("app", "chromium")])
+        self.assertEqual(
+            jl.match_routine_intents("move to workspace 5 and open chromium"),
+            [("workspace", "5"), ("app", "chromium")])
+
+    def test_move_to_workspace_is_switch(self):
+        self.assertEqual(jl.match_routine_intent("move to workspace 5"),
+                         ("workspace", "5"))
+
+    def test_open_workspace_not_an_app(self):
+        self.assertEqual(jl.match_routine_intent("open workspace 5"),
+                         ("workspace", "5"))
+        self.assertEqual(jl.match_routine_intent("open chromium"),
+                         ("app", "chromium"))
+        self.assertEqual(jl.match_routine_intent("open the terminal"),
+                         ("app", "terminal"))
+        self.assertEqual(jl.match_routine_intent("launch terminal"),
+                         ("app", "terminal"))
+
+
+class AppResolveTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="jarvis-apps-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._write("foot.desktop",
+                    "Name=Foot\nGenericName=Terminal\nExec=foot\n")
+        self._write("chromium.desktop",
+                    "Name=Chromium\nGenericName=Web Browser\n"
+                    "Exec=chromium %U\nKeywords=web;browser;\n")
+        self._write("hidden.desktop",
+                    "Name=Secret\nNoDisplay=true\nExec=secret\n")
+        self.old_dirs, self.old_owners = jo.APP_DIRS, jo.OWNERS
+        jo.APP_DIRS = [self.tmp]
+        jo.OWNERS = {os.geteuid(), 0}
+
+    def tearDown(self):
+        jo.APP_DIRS, jo.OWNERS = self.old_dirs, self.old_owners
+
+    def _write(self, name, body):
+        with open(os.path.join(self.tmp, name), "w") as fh:
+            fh.write("[Desktop Entry]\n" + body)
+
+    def test_generic_name_terminal(self):
+        self.assertEqual(jo.resolve("terminal"), "foot")
+        self.assertEqual(jo.resolve("foot"), "foot")
+
+    def test_browser_keyword_and_generic(self):
+        self.assertEqual(jo.resolve("browser"), "chromium")
+        self.assertEqual(jo.resolve("chromium"), "chromium")
+
+    def test_hidden_skipped(self):
+        self.assertIsNone(jo.resolve("secret"))
+
+    def test_no_match(self):
+        self.assertIsNone(jo.resolve("photoshop"))
 
 
 class ArgvTests(unittest.TestCase):
