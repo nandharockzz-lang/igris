@@ -751,17 +751,20 @@ def select_agent(cfg):
             log("warning: no model configured for opencode-voice; "
                 "pick one in the panel")
         else:
-            for template in (agent.command, agent.web_command or []):
+            for label, template in (("command", agent.command),
+                                    ("web_command", agent.web_command or [])):
+                if not template:
+                    continue
                 try:
                     idx = template.index("--agent")
                 except ValueError:
-                    log(f"warning: agent '{name}' argv has no '--agent'; "
-                        "cannot inject the configured model")
-                    break
+                    log(f"warning: agent '{name}' {label} has no '--agent'; "
+                        "cannot inject the configured model there")
+                    continue
                 if len(template) < idx + 2:
-                    log(f"warning: agent '{name}' argv has no agent name "
+                    log(f"warning: agent '{name}' {label} has no agent name "
                         "after '--agent'; cannot inject the configured model")
-                    break
+                    continue
                 template.insert(idx + 2, "-m")
                 template.insert(idx + 3, model_setting)
             # Advisory only: hard validation lives in `jarvis-config set
