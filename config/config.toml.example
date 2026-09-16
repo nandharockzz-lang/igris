@@ -139,14 +139,24 @@ fallback_engine = "soniox"
 # off when disarming, so Safe always starts); a hand-edit works too, but the
 # next toggle-disarm will return it to false. Never settable from the panel.
 # That broker can launch an installed .desktop entry, open an http(s) URL
-# (including a YouTube search page for a song), or set one deterministic
-# verb (volume 0-100|up|down|mute|unmute, brightness 1-100|up|down, workspace
-# NAME, mute on|off|toggle, media play|pause|toggle|next|prev|stop for
-# whatever player is running), and nothing else. It cannot pick a specific
-# video, click play, or drive a page -- those stay refused by design. Left
-# false, directives are ignored and the agent can only answer out loud.
+# (including a YouTube search page for a song), focus or move a running
+# window, switch workspaces (name, number, next, previous), toggle
+# fullscreen, lock the screen, take screenshots to ~/Pictures, show a
+# notification, or set one deterministic verb (volume 0-100|up|down|mute|
+# unmute, brightness 1-100|up|down, workspace NAME, mute on|off|toggle,
+# media play|pause|toggle|next|prev|stop for whatever player is running),
+# and nothing else. It cannot pick a specific video, click play, or drive
+# a page -- those stay refused by design. Left false, directives are
+# ignored and the agent can only answer out loud.
 # Because the action path is reply parsing rather than a CLI tool grant, it
 # works with any agent CLI.
+#
+# State-destructive or security-sensitive verbs (close-window, logout,
+# reboot, poweroff, wifi on|off) additionally need an on-screen tap: on
+# voice authority the broker stages them and the card shows Confirm/Deny
+# (see daemon/actions.py, the versioned request/result contract); only a
+# supervised act -- the Confirm tap, or --ask typed at a keyboard -- runs
+# them. There is no voice shell: spoken words can never run commands.
 #
 # It ships false. Turning it on means a sentence spoken near the microphone
 # can open an app or a web page on your screen. That is a fine trade to make

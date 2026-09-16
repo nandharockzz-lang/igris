@@ -47,6 +47,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import safefile  # noqa: E402  (needs our own directory on the path first)
+import actions  # noqa: E402  (versioned request/result contract)
 
 HOME = os.path.expanduser("~")
 DATA_HOME = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
@@ -177,9 +178,13 @@ def launch(entry_id):
 def usage():
     print("usage: jarvis-open list | app <name> | url <https://...> | "
           "volume <0-100|up|down|mute|unmute> | brightness <1-100|up|down> | "
-          "workspace <name> | mute <on|off|toggle|mute|unmute> | "
+          "workspace <name|N|next|previous> | mute <on|off|toggle|mute|unmute> | "
           "media <play|pause|toggle|next|prev|stop|quit> | music <words> | "
-          "mymusic <liked|watchlater|playlist NAME>",
+          "mymusic <liked|watchlater|playlist NAME> | "
+          "focus-window <app> | move-window <app> <workspace> | fullscreen | "
+          "lock | screenshot [full|window] | notify <text> | "
+          "close-window | logout | reboot | poweroff | wifi <on|off> | "
+          "confirm | deny",
           file=sys.stderr)
     return 2
 
@@ -291,13 +296,291 @@ def cmd_brightness(value):
 
 
 def cmd_workspace(value):
-    if not WORKSPACE_RE.match(value):
+    # Hyprland 0.55+ speaks Lua: dispatch is shorthand for eval
+    # 'hl.dispatch(...)'. Verified live on 0.56.2: focus({workspace})
+    # accepts names, numbers and +1/-1; plain `dispatch workspace N`
+    # dies in the Lua parser, so nothing here uses the legacy form.
+    if value == "next":
+        value = "+1"
+    elif value == "previous":
+        value = "-1"
+    if value in ("+1", "-1"):
+        expr = f'hl.dsp.focus({{ workspace = "{value}" }})'
+    else:
+        if not WORKSPACE_RE.match(value):
+            print("refusing bad workspace name", file=sys.stderr)
+            return 1
+        expr = f'hl.dsp.focus({{ workspace = "{value}" }})'
+    if hypr(expr):
+        print(f"workspace {value}")
+        return 0
+    return 1
+
+
+def hypr(lua):
+    """Run one Lua dispatcher expression. Only ever called with strings
+    built from validated tokens (names/numbers/addresses matched above),
+    never free speech: a quote or backslash cannot survive the regexes, so
+    none can break out of the quoted Lua string."""
+    rc, out = run_cmd(["hyprctl", "dispatch", lua])
+    # hyprctl exits 0 even when the compositor refuses: success is the
+    # literal "ok", anything else (error: ...) is a refusal.
+    if rc == 0 and out.strip() == "ok":
+        return True
+    if rc == 0:
+        print(f"compositor refused: {out[:160]}", file=sys.stderr)
+    return False
+
+
+def hypr_json(args, limit=1 << 20):
+    """Bounded JSON query (clients/activewindow). None on any failure."""
+    import json
+    try:
+        proc = subprocess.run(args, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=10,
+                              check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads((proc.stdout or b"")[:limit].decode("utf-8",
+                                                              "replace"))
+    except ValueError:
+        return None
+
+
+def find_window(query):
+    """(address, class) of one running window: exact class/title first,
+    then substring -- first hit wins, mirroring app resolution. The
+    address (hex, re-validated) is what later expressions use, so no
+    window title text ever reaches the Lua string. "this"/"current" names
+    the focused window (for "move this window to ...")."""
+    if query in ("this", "current"):
+        active = hypr_json(["hyprctl", "activewindow", "-j"])
+        if isinstance(active, dict):
+            addr = str(active.get("address", ""))
+            if actions.ADDRESS_RE.match(addr):
+                return addr, str(active.get("class", "active"))
+        return None
+    if not actions.FOCUS_QUERY_RE.match(query):
+        return None
+    clients = hypr_json(["hyprctl", "clients", "-j"])
+    if not isinstance(clients, list):
+        return None
+    q = query.lower()
+    candidates = []
+    for c in clients:
+        if not isinstance(c, dict):
+            continue
+        cls = str(c.get("class", ""))
+        title = str(c.get("title", ""))
+        addr = str(c.get("address", ""))
+        if not actions.ADDRESS_RE.match(addr):
+            continue
+        candidates.append((addr, cls, title))
+    for addr, cls, title in candidates:
+        if q in (cls.lower(), title.lower()):
+            return addr, cls
+    for addr, cls, title in candidates:
+        if q in cls.lower() or q in title.lower():
+            return addr, cls
+    return None
+
+
+def cmd_focus_window(query):
+    found = find_window(query)
+    if found is None:
+        print(f"no running window matches '{query}'", file=sys.stderr)
+        return 1
+    addr, cls = found
+    if hypr(f'hl.dsp.focus({{ window = "address:{addr}" }})'):
+        print(f"focused {cls}")
+        return 0
+    return 1
+
+
+def cmd_move_window(query, target):
+    if target == "next":
+        target = "+1"
+    elif target == "previous":
+        target = "-1"
+    if target not in ("+1", "-1") and not WORKSPACE_RE.match(target):
         print("refusing bad workspace name", file=sys.stderr)
         return 1
-    rc, _ = run_cmd(["hyprctl", "dispatch", "workspace", value])
+    found = find_window(query)
+    if found is None:
+        print(f"no running window matches '{query}'", file=sys.stderr)
+        return 1
+    addr, cls = found
+    # Move first (address-scoped, exact), then follow it there.
+    if not hypr(f'hl.dsp.window.move({{ workspace = "{target}" }})'):
+        return 1
+    hypr(f'hl.dsp.focus({{ window = "address:{addr}" }})')
+    print(f"moved {cls} to workspace {target}")
+    return 0
+
+
+def cmd_fullscreen():
+    # Toggle: verified live (2 -> 0 -> 2). No absolute mode exists in the
+    # Lua surface we probed, so the grammar offers the toggle only.
+    if hypr("hl.dsp.window.fullscreen({})"):
+        print("fullscreen toggled")
+        return 0
+    return 1
+
+
+def cmd_lock():
+    rc, _ = run_cmd(["loginctl", "lock-session"])
     if rc == 0:
-        print(f"workspace {value}")
+        print("screen locked")
     return rc
+
+
+def cmd_screenshot(mode):
+    if mode not in ("full", "window"):
+        print("refusing bad screenshot mode", file=sys.stderr)
+        return 1
+    import time
+    pictures = os.path.join(HOME, "Pictures")
+    try:
+        os.makedirs(pictures, exist_ok=True)
+    except OSError as exc:
+        print(f"cannot use ~/Pictures ({exc})", file=sys.stderr)
+        return 1
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(pictures, f"jarvis-{stamp}.png")
+    if mode == "window":
+        active = hypr_json(["hyprctl", "activewindow", "-j"])
+        try:
+            x, y = int(active["at"][0]), int(active["at"][1])
+            w, h = int(active["size"][0]), int(active["size"][1])
+        except (TypeError, KeyError, IndexError, ValueError):
+            print("no active window geometry", file=sys.stderr)
+            return 1
+        if not all(v >= -16384 and v <= 16384 for v in (x, y, w, h)):
+            print("refusing implausible geometry", file=sys.stderr)
+            return 1
+        if w <= 0 or h <= 0:
+            print("refusing empty geometry", file=sys.stderr)
+            return 1
+        geometry = f"{x},{y} {w}x{h}"
+        rc, _ = run_cmd(["grim", "-g", geometry, path], timeout=20)
+    else:
+        rc, _ = run_cmd(["grim", path], timeout=20)
+    if rc == 0:
+        print(f"screenshot saved (path not journaled)")
+    return rc
+
+
+def cmd_notify(text):
+    if not actions.NOTIFY_RE.match(text):
+        print("refusing bad notification text", file=sys.stderr)
+        return 1
+    rc, _ = run_cmd(["notify-send", "-a", "Jarvis", "Jarvis", text])
+    if rc == 0:
+        # The text itself is speech: confirm delivery, never echo it.
+        print("notification sent")
+    return rc
+
+
+def cmd_close_window():
+    # Focused window only: targeting a named window by voice risks closing
+    # the wrong one, and the focused one is what the user is looking at.
+    if hypr("hl.dsp.window.close()"):
+        print("window closed")
+        return 0
+    return 1
+
+
+def cmd_logout():
+    if hypr("hl.dsp.exit()"):
+        print("logged out")
+        return 0
+    return 1
+
+
+def cmd_reboot():
+    rc, _ = run_cmd(["systemctl", "reboot"])
+    return rc
+
+
+def cmd_poweroff():
+    rc, _ = run_cmd(["systemctl", "poweroff"])
+    return rc
+
+
+def cmd_wifi(value):
+    if not actions.WIFI_RE.match(value):
+        print("refusing bad wifi value", file=sys.stderr)
+        return 1
+    rc, _ = run_cmd(["nmcli", "radio", "wifi", value])
+    if rc == 0:
+        print(f"wi-fi {value}")
+    return rc
+
+
+def split_button(rest):
+    """Trailing --confirm-button: a supervised caller (Confirm tap, --ask
+    at a keyboard) attests the action. Voice never passes it."""
+    if rest and rest[-1] == "--confirm-button":
+        return rest[:-1], True
+    return rest, False
+
+
+def stage_or_run(action, args, confirmed, runner):
+    """needs_confirm verbs: without supervised attestation, stage the
+    request for on-screen approval and exit 2. The UI offers Confirm/Deny;
+    only `jarvis-open confirm` executes."""
+    if confirmed:
+        return runner()
+    request = actions.build_request(action, args, source="voice")
+    if request is None or not request["needs_confirm"]:
+        print("refusing invalid arguments", file=sys.stderr)
+        return 1
+    if actions.write_pending(request):
+        print(f"needs on-screen confirmation: {actions.describe(request)}",
+              file=sys.stderr)
+        return 2
+    print("cannot stage confirmation; refusing", file=sys.stderr)
+    return 1
+
+
+CONFIRMED_RUNNERS = {
+    "close-window": lambda args: cmd_close_window(),
+    "logout": lambda args: cmd_logout(),
+    "reboot": lambda args: cmd_reboot(),
+    "poweroff": lambda args: cmd_poweroff(),
+    "wifi": lambda args: cmd_wifi(args["value"]),
+}
+
+
+def cmd_confirm():
+    pending = actions.read_pending()
+    if pending is None:
+        print("nothing pending confirmation", file=sys.stderr)
+        return 1
+    runner = CONFIRMED_RUNNERS.get(pending["action"])
+    if runner is None:
+        actions.clear_pending()
+        print("refusing unknown pending action", file=sys.stderr)
+        return 1
+    rc = runner(pending["args"])
+    actions.clear_pending()
+    if rc == 0:
+        print(f"confirmed: {pending.get('description', pending['action'])}")
+    return rc
+
+
+def cmd_deny():
+    pending = actions.read_pending()
+    actions.clear_pending()
+    if pending is None:
+        print("nothing pending confirmation", file=sys.stderr)
+        return 1
+    print("denied (nothing ran)")
+    return 0
 
 
 def cmd_mute(value):
@@ -603,6 +886,84 @@ def main(argv):
         if len(rest) != 1:
             return usage()
         return cmd_mymusic(rest[0])
+
+    if command == "focus-window":
+        if len(rest) != 1:
+            return usage()
+        return cmd_focus_window(rest[0])
+
+    if command == "move-window":
+        if len(rest) != 2:
+            return usage()
+        return cmd_move_window(rest[0], rest[1])
+
+    if command == "fullscreen":
+        if rest:
+            return usage()
+        return cmd_fullscreen()
+
+    if command == "lock":
+        if rest:
+            return usage()
+        return cmd_lock()
+
+    if command == "screenshot":
+        if len(rest) > 1:
+            return usage()
+        return cmd_screenshot(rest[0] if rest else "full")
+
+    if command == "notify":
+        if len(rest) != 1:
+            return usage()
+        return cmd_notify(rest[0])
+
+    # State-destructive or security-sensitive: without a supervised
+    # --confirm-button these stage an on-screen confirmation and exit 2.
+    if command == "close-window":
+        rest, confirmed = split_button(rest)
+        if rest:
+            return usage()
+        return stage_or_run("close-window", {}, confirmed,
+                            cmd_close_window)
+
+    if command == "logout":
+        rest, confirmed = split_button(rest)
+        if rest:
+            return usage()
+        return stage_or_run("logout", {}, confirmed, cmd_logout)
+
+    if command == "reboot":
+        rest, confirmed = split_button(rest)
+        if rest:
+            return usage()
+        return stage_or_run("reboot", {}, confirmed, cmd_reboot)
+
+    if command == "poweroff":
+        rest, confirmed = split_button(rest)
+        if rest:
+            return usage()
+        return stage_or_run("poweroff", {}, confirmed, cmd_poweroff)
+
+    if command == "wifi":
+        rest, confirmed = split_button(rest)
+        if len(rest) != 1:
+            return usage()
+        value = rest[0]
+        if not actions.WIFI_RE.match(value):
+            print("refusing bad wifi value", file=sys.stderr)
+            return 1
+        return stage_or_run("wifi", {"value": value}, confirmed,
+                            lambda: cmd_wifi(value))
+
+    if command == "confirm":
+        if rest:
+            return usage()
+        return cmd_confirm()
+
+    if command == "deny":
+        if rest:
+            return usage()
+        return cmd_deny()
 
     return usage()
 

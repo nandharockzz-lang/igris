@@ -78,9 +78,12 @@ put 755 "$SRC/daemon/jarvis-agent-run" "$JARVIS_DIR/bin/jarvis-agent-run"
 put 755 "$SRC/daemon/jarvis-rollback"  "$JARVIS_DIR/bin/jarvis-rollback"
 put 755 "$SRC/daemon/jarvis-toggle"    "$JARVIS_DIR/bin/jarvis-toggle"
 # The safe-file helpers are imported by all three, and each imports it from
-# its own directory, so it lands in both.
+# its own directory, so it lands in both. actions.py is the versioned
+# local-action contract (grammar + confirmation), shared the same way.
 put 644 "$SRC/daemon/safefile.py"      "$JARVIS_DIR/safefile.py"
 put 644 "$SRC/daemon/safefile.py"      "$JARVIS_DIR/bin/safefile.py"
+put 644 "$SRC/daemon/actions.py"       "$JARVIS_DIR/actions.py"
+put 644 "$SRC/daemon/actions.py"       "$JARVIS_DIR/bin/actions.py"
 # Checksums for every voice the settings panel can download. Without it,
 # jarvis-config refuses to install a voice rather than installing an
 # unverified one.

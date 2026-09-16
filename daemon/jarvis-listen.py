@@ -38,6 +38,7 @@ import numpy as np
 # Next to this file, in the repo and in ~/.local/share/jarvis alike.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import safefile
+import actions  # versioned local-action contract (grammar, confirmation)
 
 HOME = os.path.expanduser("~")
 JARVIS_DIR = os.path.join(HOME, ".local", "share", "jarvis")
@@ -187,9 +188,21 @@ ACTIONS_PROMPT = (
     "To pause, resume or skip what is already playing in any media "
     "player: <<jarvis:media toggle|play|pause|next|prev>>. To close the "
     "mini player: <<jarvis:media quit>>. "
+    "Windows and workspaces: <<jarvis:focus-window NAME>> focuses a running "
+    "app, <<jarvis:move-window NAME TARGET>> moves it to a workspace "
+    "(number, name, next or previous), <<jarvis:workspace NAME>> (or a "
+    "number, next, previous) switches there, <<jarvis:fullscreen>> toggles "
+    "fullscreen on the focused window. Screen and capture: <<jarvis:lock>> "
+    "locks the screen, <<jarvis:screenshot>> (or <<jarvis:screenshot "
+    "window>>) saves to ~/Pictures, <<jarvis:notify TEXT>> shows a "
+    "notification. Destructive verbs exist but need the user's on-screen "
+    "tap before they run: <<jarvis:close-window>>, <<jarvis:logout>>, "
+    "<<jarvis:reboot>>, <<jarvis:poweroff>>, <<jarvis:wifi on|off>>. "
+    "Emit at most one directive line and say in your reply what it does; "
+    "if the user must confirm, say that too. "
     "You cannot browse results, click anything, or control a page: say "
-    "so out loud if asked. At most one "
-    "such line per reply. The line is stripped before your reply is spoken, "
+    "so out loud if asked. "
+    "The line is stripped before your reply is spoken, "
     "so also say in your reply what you are doing. If asked to do anything "
     "else to the machine, say out loud that you cannot."
 )
@@ -1631,12 +1644,21 @@ def clean_reply(text, strip_prefixes):
 # --------------------------------------------------------------------------
 
 DIRECTIVE_RE = re.compile(
-    r"^\s*<<jarvis:(open-app|open-url|search|volume|brightness|workspace|mute|media|music|mymusic)"
-    r"\s+([^<>\n]{1,256}?)\s*>>\s*$")
+    r"^\s*<<jarvis:(open-app|open-url|search|volume|brightness|workspace|mute|media|music|mymusic"
+    r"|focus-window|move-window|fullscreen|lock|screenshot|notify"
+    r"|close-window|logout|reboot|poweroff|wifi)"
+    r"(?:\s+([^<>\n]{1,256}?))?\s*>>\s*$")
 _DIRECTIVE_KINDS = {"open-app": "app", "open-url": "url", "search": "search",
                     "volume": "volume", "brightness": "brightness",
                     "workspace": "workspace", "mute": "mute",
-                    "media": "media", "music": "music", "mymusic": "mymusic"}
+                    "media": "media", "music": "music", "mymusic": "mymusic",
+                    "focus-window": "focus-window",
+                    "move-window": "move-window",
+                    "fullscreen": "fullscreen", "lock": "lock",
+                    "screenshot": "screenshot", "notify": "notify",
+                    "close-window": "close-window", "logout": "logout",
+                    "reboot": "reboot", "poweroff": "poweroff",
+                    "wifi": "wifi"}
 # Web-tainted replies get every <<jarvis:*>> stripped, even a malformed one
 # that DIRECTIVE_RE would not match -- what came off the web is never trusted
 # to even look like a directive.
@@ -1699,7 +1721,9 @@ def directive_summary(kind, value):
         except ValueError:
             return "(invalid url)"
     if kind in ("volume", "brightness", "mute", "media"):
-        return value[:16]
+        return value[:16] if isinstance(value, str) else kind
+    if isinstance(value, (list, tuple)):
+        return f"{kind}_len={sum(len(str(v)) for v in value)}"
     return f"{kind}_len={len(value)}"
 
 
@@ -1760,7 +1784,7 @@ def extract_directive(reply):
         if match:
             if directive is None:
                 directive = (_DIRECTIVE_KINDS[match.group(1)],
-                             match.group(2).strip())
+                             (match.group(2) or "").strip())
             continue
         kept.append(line)
     return "\n".join(kept).strip(), directive
@@ -1769,13 +1793,28 @@ def extract_directive(reply):
 def run_directive(directive, mode="safe", approval_source="voice",
                   require_arm=False, arm_file=ARM_FILE):
     """Public entry: publishes the tool category for the activity indicator,
-    then enforces + executes. Category only -- never arguments."""
+    then enforces + executes. Category only -- never arguments.
+
+    Returns True on success, False on refusal/failure, or "pending" when
+    the broker staged an on-screen confirmation (needs_confirm verb on
+    voice authority): the caller must tell the user to tap Confirm/Deny.
+    """
     publish_tool(f"broker:{directive[0]}")
     try:
         return _run_directive(directive, mode, approval_source,
                               require_arm, arm_file)
     finally:
         publish_tool(f"broker:{directive[0]}")
+
+
+def _refuse(mode, kind, summary, approval_source, reason):
+    """Shared refusal: log the reason, audit the shape, return False."""
+    log(f"directive refused: {reason}")
+    audit({"mode": mode, "transcript_len": 0, "tool_name": f"broker:{kind}",
+           "args_summary_sanitized": summary,
+           "approval_source": approval_source,
+           "result_code": "refused-validation"})
+    return False
 
 
 def _run_directive(directive, mode="safe", approval_source="voice",
@@ -1876,6 +1915,48 @@ def _run_directive(directive, mode="safe", approval_source="voice",
                "args_summary_sanitized": summary,
                "approval_source": approval_source, "result_code": "refused-validation"})
         return False
+    # New broker verbs validate against the shared contract grammar (see
+    # daemon/actions.py): fixed intents, strict args, confirmation flags.
+    argv_extra = []
+    if kind in ("focus-window",):
+        if not actions.FOCUS_QUERY_RE.match(value):
+            return _refuse(mode, kind, summary, approval_source,
+                           "focus query failed validation")
+    elif kind == "move-window":
+        # Fast path passes [query, target]; agent directives pass one
+        # string split on the last space (target is the validated tail).
+        if isinstance(value, list) and len(value) == 2:
+            query, target = value
+        elif isinstance(value, str):
+            query, _, target = value.rpartition(" ")
+        else:
+            return _refuse(mode, kind, summary, approval_source,
+                           "move-window needs QUERY TARGET")
+        target = {"next": "+1", "previous": "-1"}.get(target, target)
+        if not query or not actions.FOCUS_QUERY_RE.match(query) or \
+                not (target in ("+1", "-1") or WORKSPACE_RE.match(target)):
+            return _refuse(mode, kind, summary, approval_source,
+                           "move-window needs QUERY TARGET")
+        argv_extra = [query, target]
+        summary = directive_summary(kind, value)
+    elif kind in ("fullscreen", "lock", "close-window", "logout", "reboot",
+                  "poweroff"):
+        if value:
+            return _refuse(mode, kind, summary, approval_source,
+                           "this verb takes no argument")
+    elif kind == "screenshot":
+        if value and value not in ("full", "window"):
+            return _refuse(mode, kind, summary, approval_source,
+                           "screenshot wants full|window")
+        argv_extra = [value] if value else []
+    elif kind == "notify":
+        if not actions.NOTIFY_RE.match(value):
+            return _refuse(mode, kind, summary, approval_source,
+                           "notification text failed validation")
+    elif kind == "wifi":
+        if not actions.WIFI_RE.match(value):
+            return _refuse(mode, kind, summary, approval_source,
+                           "wifi wants on|off")
     broker = jarvis_open_path()
     if broker is None:
         log("directive refused: jarvis-open broker not found")
@@ -1883,8 +1964,17 @@ def _run_directive(directive, mode="safe", approval_source="voice",
                "args_summary_sanitized": summary,
                "approval_source": approval_source, "result_code": "refused-no-broker"})
         return False
+    broker_argv = [broker, kind] + argv_extra
+    if not argv_extra and value:
+        broker_argv.append(value)
+    # Supervised invocations (--ask at a keyboard, panel/button taps)
+    # attest needs_confirm verbs directly; the always-on voice path never
+    # passes the flag, so the broker stages an on-screen confirmation.
+    if actions.ACTIONS.get(kind, {}).get("confirm", False) \
+            and approval_source != "voice":
+        broker_argv.append("--confirm-button")
     try:
-        proc = run_bounded([broker, kind, value],
+        proc = run_bounded(broker_argv,
                            timeout=BROKER_TIMEOUTS.get(kind, 15),
                            stdout_limit=64 << 10, stderr_limit=16 << 10)
     except (OSError, subprocess.TimeoutExpired):
@@ -1893,6 +1983,15 @@ def _run_directive(directive, mode="safe", approval_source="voice",
                "args_summary_sanitized": summary,
                "approval_source": approval_source, "result_code": "error-exec"})
         return False
+    if proc.returncode == 2:
+        # Broker staged an on-screen confirmation: not a refusal, not a
+        # success. The caller tells the user to tap Confirm/Deny.
+        log(f"jarvis-open: confirmation staged for {kind}")
+        audit({"mode": mode, "transcript_len": 0, "tool_name": f"broker:{kind}",
+               "args_summary_sanitized": summary,
+               "approval_source": approval_source,
+               "result_code": "pending-confirm"})
+        return "pending"
     if proc.returncode != 0 or proc.overflowed:
         log(f"jarvis-open refused: {(proc.stderr or proc.stdout).strip()[:200]}")
         audit({"mode": mode, "transcript_len": 0, "tool_name": f"broker:{kind}",
@@ -2053,8 +2152,14 @@ ROUTINE_CONFIRM = {
     "volume": "Volume adjusted.", "brightness": "Brightness adjusted.",
     "workspace": "Switching workspace.", "mute": "Done.",
     "media": "Done.", "music": "Playing it now.",
-    "mymusic": "Playing it now.",
+    "mymusic": "Playing it now.", "focus-window": "Focusing it now.",
+    "move-window": "Moving it now.", "fullscreen": "Toggling fullscreen.",
+    "lock": "Locking the screen.", "screenshot": "Screenshot saved.",
+    "notify": "Noted.",
 }
+# Spoken when a needs_confirm verb stages on-screen approval (nothing ran).
+PENDING_CONFIRM = ("That one needs a tap to confirm -- "
+                   "check the card for Confirm or Deny.")
 
 
 def _command_words(text):
@@ -2132,6 +2237,63 @@ def match_routine_intent(text):
     m = re.match(r"^open ([a-z0-9][a-z0-9 ._\-]{0,30})$", t)
     if m:
         return ("app", m.group(1).strip())
+    # Workspaces: number, name, or step. ("switch to X" for apps lives in
+    # the focus rules below, which refuse a leading "workspace".)
+    m = re.match(r"^(?:switch to|go to|open|show) workspace "
+                 r"([a-z0-9][a-z0-9 _.\-]{0,31})$", t)
+    if m:
+        return ("workspace", m.group(1).strip())
+    m = re.match(r"^workspace ([a-z0-9][a-z0-9 _.\-]{0,31})$", t)
+    if m:
+        return ("workspace", m.group(1).strip())
+    if re.match(r"^(?:go to |switch to |move to )?(?:the )?"
+                r"(next|previous) workspace$", t):
+        which = "next" if "next" in t.split() else "previous"
+        return ("workspace", which)
+    # Focus / move windows. Focus refuses bare "workspace ..." so the two
+    # never collide; move needs an explicit workspace target.
+    m = re.match(r"^(?:focus|switch to|bring to front|show) "
+                 r"([a-z0-9][a-z0-9 ._\-+]{0,40})$", t)
+    if m and not m.group(1).startswith("workspace"):
+        return ("focus-window", m.group(1).strip())
+    m = re.match(r"^move (?:the |this |current )?(.+?) to workspace "
+                 r"([a-z0-9][a-z0-9 _.\-]{0,31}|next|previous)$", t)
+    if m:
+        query = " ".join(m.group(1).split())
+        if query in ("window", "this window", "current window", "it"):
+            query = "this"
+        if actions.FOCUS_QUERY_RE.match(query):
+            return ("move-window", [query, m.group(2).strip()])
+        return None
+    if re.match(r"^(?:toggle |make (?:it|this) )?fullscreen$", t):
+        return ("fullscreen", "")
+    if re.match(r"^lock (?:the )?screen$", t):
+        return ("lock", "")
+    if re.match(r"^take a screenshot$", t) or t == "screenshot":
+        return ("screenshot", "full")
+    if re.match(r"^screenshot (?:this|the|current) window$", t):
+        return ("screenshot", "window")
+    m = re.match(r"^remind me to ([a-z0-9][a-z0-9 .,!?\'\"()\-]{0,120})$",
+                 t)
+    if m:
+        text = " ".join(m.group(1).split())
+        if actions.NOTIFY_RE.match(text):
+            return ("notify", text)
+        return None
+    # Close: the focused window only. (Music-player closes stay media quit.)
+    if re.match(r"^close (?:this|the current|the) window$", t):
+        return ("close-window", "")
+    m = re.match(r"^(?:log|sign) (?:me )?out$", t)
+    if m:
+        return ("logout", "")
+    if re.match(r"^reboot(?: the (?:machine|computer|system))?$", t):
+        return ("reboot", "")
+    if re.match(r"^(?:power off|shut down|shutdown)"
+                r"(?: the (?:machine|computer|system))?$", t):
+        return ("poweroff", "")
+    m = re.match(r"^(?:turn )?wi-?fi (on|off)$", t)
+    if m:
+        return ("wifi", m.group(1))
     return None
 
 
@@ -2154,8 +2316,24 @@ def respond(agent, voice, text, log_text=False, mode="safe",
         # or a non-match falls through to the agent below.
         routine = match_routine_intent(text)
         if routine is not None:
-            if run_directive(routine, mode, approval_source,
-                             require_arm=(approval_source == "voice")):
+            outcome = run_directive(routine, mode, approval_source,
+                                    require_arm=(approval_source == "voice"))
+            if outcome == "pending":
+                # Destructive/security-sensitive on voice authority: staged
+                # for an on-screen tap, nothing ran yet.
+                answer = PENDING_CONFIRM
+                audit({"mode": mode, "transcript_len": len(text),
+                       "tool_name": f"broker:{routine[0]}",
+                       "args_summary_sanitized": directive_summary(*routine),
+                       "approval_source": approval_source,
+                       "result_code": "pending-confirm"})
+                log("reply: confirmation staged (routine intent, "
+                    "no model call)")
+                publish_ui_text(RESPONSE_FILE, answer)
+                set_state("speaking")
+                speak(answer, voice)
+                return answer
+            if outcome:
                 answer = ROUTINE_CONFIRM.get(routine[0], "Doing it now.")
                 audit({"mode": mode, "transcript_len": len(text),
                        "tool_name": f"broker:{routine[0]}",
@@ -2179,7 +2357,10 @@ def respond(agent, voice, text, log_text=False, mode="safe",
         if agent.actions:
             ok = run_directive(directive, mode, approval_source,
                                require_arm=(approval_source == "voice"))
-            if ok and not answer:
+            if ok == "pending":
+                note = PENDING_CONFIRM
+                answer = (answer + " " + note).strip() if answer else note
+            elif ok and not answer:
                 answer = "Doing it now."
             elif not ok:
                 answer = (answer + " Sorry, that did not open.").strip()

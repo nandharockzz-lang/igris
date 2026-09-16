@@ -18,6 +18,14 @@ Item {
     (Quickshell.env("XDG_RUNTIME_DIR") ||
      Quickshell.env("XDG_STATE_HOME") || (root.home + "/.local/state")) + "/jarvis"
   readonly property string toggleBin: root.home + "/.local/share/jarvis/bin/jarvis-toggle"
+  readonly property string brokerBin: root.home + "/.local/share/jarvis/bin/jarvis-open"
+
+  // Staged destructive/security-sensitive action awaiting an on-screen
+  // tap. The broker writes it, these buttons run `jarvis-open confirm`
+  // or `deny`; expiry (120s) is enforced by the broker on read, and the
+  // card re-polls, so a stale file clears itself from the screen.
+  property bool pendingActive: false
+  property string pendingText: ""
 
   property string serviceState: "unknown"
   property string pipeline: "off"
@@ -197,7 +205,9 @@ Item {
     root.speaking || root.pipeline === "thinking" || holdTimer.running ||
     root.peeked
   readonly property bool showAvatar: root.active
-  readonly property bool consoleVisible: root.active
+  // A staged confirmation opens the card on its own: the tap it needs
+  // is on screen, with nothing else to do first.
+  readonly property bool consoleVisible: root.active || root.pendingActive
 
   function selectActivePlayer() {
     var list = root.mprisPlayers || []
@@ -218,6 +228,7 @@ Item {
     if (!stateProc.running) stateProc.running = true
     if (!requestProc.running) requestProc.running = true
     if (!responseProc.running) responseProc.running = true
+    if (!pendingProc.running) pendingProc.running = true
     root.refreshWakeFresh()
   }
 
@@ -342,6 +353,52 @@ Item {
     id: toggleProc
     command: [root.toggleBin]
     onExited: { root.busy = false; root.refresh() }
+  }
+
+  // Pending confirmation, polled with everything else. The file is JSON
+  // {description, created}; anything unparseable or older than the
+  // broker's TTL reads as absent.
+  Process {
+    id: pendingProc
+    command: ["sh", "-c", "timeout 1 head -c 4096 \"$1/pending-action\" 2>/dev/null",
+              "jarvis-pending", root.runtimeDir]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var active = false
+        var label = ""
+        try {
+          var p = JSON.parse(String(text || ""))
+          if (p && p.description && p.created) {
+            var age = Date.now() / 1000 - parseInt(p.created, 10)
+            if (age >= 0 && age < 120) {
+              active = true
+              label = String(p.description).slice(0, 200)
+            }
+          }
+        } catch (e) {}
+        root.pendingActive = active
+        root.pendingText = label
+        root.refreshExpanded()
+      }
+    }
+  }
+
+  function answerPending(confirmed) {
+    if (root.busy) return
+    root.busy = true
+    pendingAnswerProc.command = [root.brokerBin, confirmed ? "confirm" : "deny"]
+    pendingAnswerProc.running = true
+  }
+
+  Process {
+    id: pendingAnswerProc
+    onExited: {
+      root.busy = false
+      root.pendingActive = false
+      root.pendingText = ""
+      root.refresh()
+    }
   }
 
   Process {
@@ -545,6 +602,99 @@ Item {
             width: parent.width
             maximumLineCount: 6
             elide: Text.ElideRight
+          }
+        }
+
+        // On-screen confirmation for staged destructive actions. Confirm
+        // runs `jarvis-open confirm` (the tap IS the authorization); Deny
+        // drops it. Nothing here runs anything else.
+        Rectangle {
+          visible: root.pendingActive
+          width: parent.width
+          height: pendingColumn.implicitHeight + 18
+          radius: 10
+          color: Qt.rgba(0.95, 0.55, 0.20, 0.14)
+          border.width: 1
+          border.color: "#f0883e"
+
+          Column {
+            id: pendingColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 9
+            spacing: 8
+
+            Text {
+              text: "Confirm action"
+              color: "#f0883e"
+              font.bold: true
+              font.pixelSize: 11
+              font.letterSpacing: 1.5
+              width: parent.width
+            }
+            Text {
+              text: root.pendingText
+              color: "#f0f6fc"
+              font.pixelSize: 13
+              wrapMode: Text.WordWrap
+              width: parent.width
+            }
+            Row {
+              width: parent.width
+              spacing: 8
+
+              Rectangle {
+                id: confirmButton
+                width: (parent.width - 8) / 2
+                height: 34
+                radius: 8
+                color: "#3fb950"
+                scale: confirmMouse.pressed ? 0.94 : 1.0
+                Behavior on scale { NumberAnimation { duration: 90 } }
+                Text {
+                  anchors.centerIn: parent
+                  text: "Confirm"
+                  color: "#081018"
+                  font.bold: true
+                  font.pixelSize: 13
+                }
+                MouseArea {
+                  id: confirmMouse
+                  anchors.fill: parent
+                  acceptedButtons: Qt.LeftButton
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: { root.keepPeek(); root.answerPending(true) }
+                }
+              }
+
+              Rectangle {
+                id: denyButton
+                width: parent.width - confirmButton.width - 8
+                height: 34
+                radius: 8
+                color: Qt.rgba(1, 1, 1, 0.12)
+                border.width: 1
+                border.color: "#8b949e"
+                scale: denyMouse.pressed ? 0.94 : 1.0
+                Behavior on scale { NumberAnimation { duration: 90 } }
+                Text {
+                  anchors.centerIn: parent
+                  text: "Deny"
+                  color: "#f0f6fc"
+                  font.pixelSize: 13
+                }
+                MouseArea {
+                  id: denyMouse
+                  anchors.fill: parent
+                  acceptedButtons: Qt.LeftButton
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: { root.keepPeek(); root.answerPending(false) }
+                }
+              }
+            }
           }
         }
 
