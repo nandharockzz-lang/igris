@@ -350,7 +350,7 @@ Item {
     onExited: { root.busy = false; root.refresh() }
   }
 
-  // Delayed hide so the card's fade/slide-out animation can play instead
+  // Delayed hide so the card's fade-out animation can play instead
   // of being cut off the moment active flips false.
   Timer {
     id: cardHideTimer
@@ -363,11 +363,18 @@ Item {
     else cardHideTimer.stop()
   }
 
+  // Dedicated card surface: a small top-right window sized to the card,
+  // not a fullscreen transparent sheet. The window unmaps with the card
+  // (visible follows it), and the mask limits input to the card rect, so
+  // the click region always exactly matches the visible card -- never a
+  // stale fullscreen region, never an invisible catcher.
   PanelWindow {
     id: overlay
-    visible: true
+    visible: card.visible
     screen: Quickshell.screens && Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
-    anchors { top: true; right: true; bottom: true; left: true }
+    anchors { top: true; right: true }
+    implicitWidth: card.width + 18
+    implicitHeight: card.height + 18
     color: "transparent"
     WlrLayershell.namespace: "dorian-voice-console"
     WlrLayershell.layer: WlrLayer.Overlay
@@ -398,11 +405,10 @@ Item {
 
       Behavior on opacity { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
 
+      // Hide animation stays inside the window: fade plus a slight rise.
+      // (A slide off-screen would clip on the dedicated surface and drag
+      // the input mask away from the fading card.)
       transform: Translate {
-        x: root.consoleVisible ? 0 : card.width + 28
-        Behavior on x {
-          NumberAnimation { duration: 240; easing.type: Easing.OutCubic }
-        }
         y: root.consoleVisible ? 0 : -10
         Behavior on y {
           NumberAnimation { duration: 240; easing.type: Easing.OutCubic }
@@ -413,6 +419,17 @@ Item {
       // bound to the content's implicit height, and animating it raced the
       // layershell input mask: the button rendered before its click region
       // existed, so clicks visibly landed on a dead button.
+
+      // Card background catcher, beneath every control: any press inside
+      // the card extends a peek so it can't vanish mid-interaction, and
+      // the opaque card owns its clicks instead of leaking them through.
+      MouseArea {
+        id: cardMouse
+        anchors.fill: parent
+        acceptedButtons: Qt.LeftButton | Qt.RightButton
+        onPressed: root.keepPeek()
+        onClicked: root.keepPeek()
+      }
 
       Column {
         id: contentColumn
@@ -429,6 +446,10 @@ Item {
             id: miniAvatarWrap
             width: 76
             height: 76
+            // Press feedback mirroring the play button, so a click visibly
+            // registers even before the daemon state round-trips back.
+            scale: avatarMouse.pressed ? 0.92 : 1.0
+            Behavior on scale { NumberAnimation { duration: 90 } }
 
             Avatar {
               anchors.centerIn: parent
@@ -442,9 +463,13 @@ Item {
               highContrast: false
             }
 
+            // Left steps Basic/Full, right disarms. Explicit buttons,
+            // hover and cursor: this is a control, not decoration.
             MouseArea {
+              id: avatarMouse
               anchors.fill: parent
               acceptedButtons: Qt.LeftButton | Qt.RightButton
+              hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: function(mouse) {
                 root.keepPeek()
