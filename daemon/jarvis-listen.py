@@ -104,10 +104,10 @@ DEFAULTS = {
     "draggable_avatar_enabled": True,
     "stt": {
         "engine": "whisper",
-        # Round-1 benchmark (14 TTS commands, this CPU): base.en and
+        # Benchmark (14 TTS + 14 mic phrases, this CPU): base.en and
         # small.en tie on accuracy (WER 0.058) while base.en answers in
-        # 1.4s vs 9.1s. Bigger is not better here; revisit after the
-        # recorded-mic round and the parakeet comparison.
+        # 1.3s vs 8.2s. Bigger is not better here; revisit after the
+        # parakeet comparison.
         "model": "base.en",
         "language": "en",
         # Command-vocabulary bias for whisper's initial prompt. Short nouns
