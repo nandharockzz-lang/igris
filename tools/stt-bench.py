@@ -113,9 +113,10 @@ def transcribe(path, cand, cfg):
     return (lines[-1] if lines else ""), dt
 
 
-def bench():
+def bench(prefix="cmd"):
     refs = phrases()
-    wavs = [os.path.join(WAV_DIR, f"cmd{i:02d}.wav") for i in range(len(refs))]
+    wavs = [os.path.join(WAV_DIR, f"{prefix}{i:02d}.wav")
+            for i in range(len(refs))]
     missing = [w for w in wavs if not os.path.exists(w)]
     if missing:
         sys.exit(f"missing wavs (run synthesize first): {missing[:3]}")
@@ -142,6 +143,8 @@ def bench():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] not in ("synthesize", "bench"):
-        sys.exit("usage: stt-bench.py [synthesize|bench]")
-    {"synthesize": synthesize, "bench": bench}[sys.argv[1]]()
+    if len(sys.argv) != 2 or sys.argv[1] not in ("synthesize", "bench",
+                                                 "bench-mic"):
+        sys.exit("usage: stt-bench.py [synthesize|bench|bench-mic]")
+    {"synthesize": synthesize, "bench": lambda: bench("cmd"),
+     "bench-mic": lambda: bench("mic")}[sys.argv[1]]()
