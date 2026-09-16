@@ -451,7 +451,7 @@ Item {
             scale: avatarMouse.pressed ? 0.92 : 1.0
             Behavior on scale { NumberAnimation { duration: 90 } }
 
-            Avatar {
+            GokuAvatar {
               anchors.centerIn: parent
               side: 76
               state: root.avatarState

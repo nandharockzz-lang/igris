@@ -230,7 +230,7 @@ PanelWindow {
             NumberAnimation { duration: 300; easing.type: Easing.OutBack }
         }
 
-        ChibiAvatar {
+        GokuAvatar {
             anchors.fill: parent
             side: 96 // matches the window above; avoids a width<->side loop
             state: root.avatarState
