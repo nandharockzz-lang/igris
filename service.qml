@@ -83,6 +83,35 @@ Item {
     onLoaded: root.syncAvatarProps()
   }
 
+  // Peek: right-clicking the idle avatar re-opens the card on demand
+  // (media controls included) without any voice activity. Auto-hides, and
+  // any click inside the card extends the stay so it can't vanish
+  // mid-interaction.
+  Timer {
+    id: peekTimer
+    interval: 15000
+    repeat: false
+    onTriggered: {
+      root.peeked = false
+      root.refreshExpanded()
+    }
+  }
+
+  function peekCard() {
+    root.peeked = true
+    peekTimer.restart()
+    root.refreshExpanded()
+  }
+
+  function keepPeek() {
+    if (root.peeked) peekTimer.restart()
+  }
+
+  Connections {
+    target: draggableAvatarLoader.item
+    function onPeekRequested() { root.peekCard() }
+  }
+
   function syncAvatarProps() {
     var a = draggableAvatarLoader.item
     if (!a) return
@@ -160,10 +189,13 @@ Item {
     if (root.wakeAt > 0 && now - root.wakeAt < 2) return "wake"
     return "idle"
   }
-  // Active = voice activity only. hasText is content (shown inside the
-  // card while open), hasMedia never opens the card by itself.
+  // Active = voice activity, the post-speech hold, or a manual peek from
+  // the avatar. hasText is content (shown inside the card while open),
+  // hasMedia never opens the card by itself.
+  property bool peeked: false
   readonly property bool active: root.listening ||
-    root.speaking || root.pipeline === "thinking" || holdTimer.running
+    root.speaking || root.pipeline === "thinking" || holdTimer.running ||
+    root.peeked
   readonly property bool showAvatar: root.active
   readonly property bool consoleVisible: root.active
 
@@ -230,10 +262,19 @@ Item {
 
   function togglePlayback() {
     var p = root.activePlayer
-    if (!p) return
-    if (p.canTogglePlaying) p.togglePlaying()
-    else if (p.isPlaying && p.canPause) p.pause()
-    else if (!p.isPlaying && p.canPlay) p.play()
+    if (!p) {
+      console.log("[jarvis] play/pause: no active player")
+      return
+    }
+    try {
+      if (p.canTogglePlaying) p.togglePlaying()
+      else if (p.isPlaying && p.canPause) p.pause()
+      else if (!p.isPlaying && p.canPlay) p.play()
+      else console.log("[jarvis] play/pause: player advertises no usable transport")
+    } catch (e) {
+      console.log("[jarvis] play/pause failed: " + e)
+    }
+    root.keepPeek()
   }
 
   Process {
@@ -368,8 +409,10 @@ Item {
         }
       }
 
-      Behavior on width { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
-      Behavior on height { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+      // NOTE: no Behavior on width/height here on purpose. The height is
+      // bound to the content's implicit height, and animating it raced the
+      // layershell input mask: the button rendered before its click region
+      // existed, so clicks visibly landed on a dead button.
 
       Column {
         id: contentColumn
@@ -404,6 +447,7 @@ Item {
               acceptedButtons: Qt.LeftButton | Qt.RightButton
               cursorShape: Qt.PointingHandCursor
               onClicked: function(mouse) {
+                root.keepPeek()
                 if (mouse.button === Qt.RightButton) root.disarm()
                 else root.toggleMode()
               }
@@ -509,13 +553,19 @@ Item {
           }
 
           Rectangle {
+            id: playButton
             anchors.right: parent.right
             anchors.rightMargin: 8
             anchors.verticalCenter: parent.verticalCenter
-            width: 34
-            height: 30
+            width: 44
+            height: 36
             radius: 8
+            z: 2
             color: root.modeColor
+            // Shrink while held so a click visibly registers even before
+            // the player state round-trips back.
+            scale: playMouse.pressed ? 0.9 : 1.0
+            Behavior on scale { NumberAnimation { duration: 90 } }
             Text {
               anchors.centerIn: parent
               text: root.activePlayer && root.activePlayer.isPlaying ? "󰏤" : "󰐊"
@@ -523,7 +573,11 @@ Item {
               font.pixelSize: 16
             }
             MouseArea {
+              id: playMouse
               anchors.fill: parent
+              acceptedButtons: Qt.LeftButton
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
               onClicked: root.togglePlayback()
             }
           }

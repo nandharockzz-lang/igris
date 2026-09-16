@@ -53,6 +53,8 @@ if [[ $SRC != "$PLUGIN_DIR" ]]; then
   put 644 "$SRC/BarWidget.qml" "$PLUGIN_DIR/BarWidget.qml"
   put 644 "$SRC/Panel.qml"     "$PLUGIN_DIR/Panel.qml"
   put 644 "$SRC/Avatar.qml"    "$PLUGIN_DIR/Avatar.qml"
+  put 644 "$SRC/ChibiAvatar.qml" "$PLUGIN_DIR/ChibiAvatar.qml"
+  put 644 "$SRC/DraggableAvatar.qml" "$PLUGIN_DIR/DraggableAvatar.qml"
   put 644 "$SRC/EqBars.qml"    "$PLUGIN_DIR/EqBars.qml"
   put 644 "$SRC/service.qml"   "$PLUGIN_DIR/service.qml"
   echo "  -> $PLUGIN_DIR"

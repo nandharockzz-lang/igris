@@ -1,130 +1,271 @@
-# Jarvis Voice Assistant Plugin
+# Jarvis: a wake-word voice assistant for the Omarchy bar
 
-This is the Jarvis voice assistant plugin for the Iris system. It provides voice interaction capabilities including wake word detection, speech-to-text, text-to-speech, and AI model integration.
+Say **"hey jarvis"**, ask a question, hear the answer. A bar widget arms and
+disarms the listener and shows what it is doing.
 
-## Prerequisites
+Everything except the agent call runs on your machine: [openWakeWord] listens
+on a continuous 16kHz mic stream, [voxtype]'s local whisper model transcribes,
+[piper] speaks the reply. Only the transcribed *text* ever leaves the machine,
+and only when you say the wake word.
 
-- Linux-based system (Ubuntu/Debian recommended)
-- Python 3.8 or higher
-- Git
-- Microphone and speakers/headphones
-- Internet connection (for model downloads and API calls if using cloud models)
-- NVIDIA GPU with CUDA support (recommended for local model inference, but CPU-only mode is available)
+Which agent answers is configuration, not code. Ships a tested, tool-free
+preset for **Claude Code**; adding another CLI is a few lines of TOML, with
+the caveat described in [`config/config.toml.example`](config/config.toml.example).
 
-## Installation
+[openWakeWord]: https://github.com/dscripka/openWakeWord
+[voxtype]: https://github.com/omarchy/voxtype
+[piper]: https://github.com/rhasspy/piper
 
-1. **Clone the repository** (if not already done):
-   ```bash
-   git clone <repository-url>
-   cd igris
-   ```
+---
 
-2. **Run the installation script**:
-   ```bash
-   chmod +x install.sh
-   ./install.sh
-   ```
-   The installation script will:
-   - Install required Python packages
-   - Download necessary models (if configured for local models)
-   - Set up system services for the daemon
-   - Configure audio devices
+## ⚠️ Read this before installing
 
-3. **Configuration**:
-   - Edit the configuration file in `config/` to set your preferred models, wake word sensitivity, and audio settings.
-   - For model selection, see the Model Selector Usage section below.
+This puts an **always-on microphone daemon** on your machine. It holds the mic
+open whenever it is armed, and when it hears the wake word it sends what you
+said to whichever agent you configured, which is a cloud service unless you
+point it at a local model.
 
-## Usage
+It is off until you arm it, and the widget shows when it is listening. But you
+should be comfortable with that trade before installing. Omarchy plugins run
+unsandboxed with your user's permissions.
 
-### Starting the Jarvis Assistant
+**Actions are off by default.** Set `actions = true` and the agent can also
+**launch apps and open URLs**. Worth being precise about what holds that
+line: the agent CLI is never granted a shell or a tool, in either mode, and
+that is a flag on the invocation rather than a hope -- the shipped Claude
+preset passes `--tools ""` (the empty built-in allowlist) and
+`--strict-mcp-config` with no `--mcp-config`, so neither the built-in tools
+nor any MCP server from your own config is loaded for the call. To
+act, it ends its reply with a structured `<<jarvis:open-app …>>` or
+`<<jarvis:open-url …>>` line; the daemon parses that against a strict
+pattern, validates the argument, and directly execs `jarvis-open` -- a broker
+that can start an installed `.desktop` entry or open an `http(s)` URL and
+nothing else, and that re-validates its arguments itself. No shell sits
+anywhere in that path, and with `actions = false` directives are stripped and
+ignored. Turn it on if you want a voice assistant that acts. Leave it off and
+the agent can only talk.
 
-To start the Jarvis voice assistant daemon:
+**Web search is off by default.** Give an agent a `web_command` (see the
+example config) and it can answer with one web-enabled round: the normal
+no-tools call may reply with a search request, and Jarvis re-invokes the
+agent with the CLI's own read-only search tool granted -- `WebSearch` for
+Claude Code, enforced by the CLI -- and nothing else. The two calls split the
+trust: the call that can act never saw the web, and the call that saw the web
+cannot act -- every directive in its reply is stripped and ignored, and there
+is no second hop. So a hostile page the search surfaced can at worst say
+something wrong out loud; it cannot open apps or URLs or search again. Two
+things to accept before enabling it: your question may reach a search
+provider through the agent, and a spoken answer is only as good as the pages
+behind it.
 
-```bash
-# From the igris directory
-./daemon/jarvis-daemon start
+A mode toggle is one keybinding away in `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + SHIFT + J", "Jarvis Basic/Full toggle",
+       "/home/sicarius/.local/share/jarvis/bin/jarvis-toggle")
 ```
 
-Or to run it in the foreground for debugging:
+(Adjust the home directory to yours: that is where `install.sh` puts the
+helper.) Stopped -> Basic -> Full -> stopped. Arming also flips the broker
+verbs flag on for the selected voice agent (and disarming flips it back, so
+Safe can never refuse startup); hand-editing `actions` still works but the
+toggle will manage it from then on. The hotkey only *requests*: the daemon
+validates every transition and owns the state, so a refused combination
+surfaces as an error instead of switching. A second press on Full disarms
+immediately and stops new tool calls.
 
-```bash
-./daemon/jarvis-daemon debug
+Panic stays separate, on `SUPER + SHIFT + K`:
+
+```lua
+o.bind("SUPER + SHIFT + K", "Jarvis panic (stop everything)",
+       "/home/sicarius/.local/share/jarvis/bin/jarvis-rollback --panic")
 ```
 
-### Stopping the Jarvis Assistant
+That stops the listener, terminates tracked privileged runs, and clears the
+arm state, mid-word. The bar widget's right-click steps the same Basic/Full
+toggle with a mouse, and tapping the panel avatar disarms.
 
-```bash
-./daemon/jarvis-daemon stop
+**Modes.** `Safe` answers only and is the only always-on mode. `Basic`
+(workspace) adds Siri-like broker verbs -- volume, brightness, apps,
+workspaces, mute, media transport keys, YouTube search-and-play, and your
+own library (`mymusic liked|watchlater|playlist NAME`, opened logged-in in
+your default browser with zero credentials on our side) -- on an explicit
+arm window (30 min default) with no shell, no files, no tools. Set
+`player = "mpv"` under `[music]` and songs play as audio with no window at
+all (`"mpv-video"` for a small always-on-top window instead); pause, resume,
+skip and closing the player keep working through the media verb
+("pause", "next", "quit the music"). no files, no tools. Routine
+commands ("play X", "pause", "volume up") never reach the model: the daemon
+matches them locally and runs the same broker, so they answer in about a
+second; anything ambiguous falls through to the assistant.
+no files, no tools. `Full` (privileged) adds sandboxed full-tools on a short
+5-minute window with a visible countdown; destructive operations always need
+a keyboard/button confirmation -- voice may announce Full mode but never
+authorizes destruction. The widget shows an anime avatar (ring: blue Safe,
+green Basic, orange Full, gray mic-off, red error), a mode badge with
+countdown, a live mic EQ while listening, and a tool-category chip while
+working. Mouth movement follows real Piper playback amplitude; the EQ follows
+live gated mic levels and dims when listening ends. Tapping the panel avatar
+disarms. Reduced-motion and high-contrast options live in the widget
+settings. None of this changes permissions: the daemon enforces every mode
+invariant exactly as before.
+
+**Rollback** is `jarvis-rollback`: it terminates tracked privileged runs
+first (config edits alone could never stop them), clears the arm state, sets
+`agent=opencode-voice`, `mode=safe`, `actions=false`, and restarts the daemon
+only if it was running.
+
+Two more things worth knowing:
+
+- What you say is handed to the agent CLI on **stdin**, never on its command
+  line (argv is readable by every process on the machine), and the journal
+  records how long each exchange was, not what was said -- unless you opt in
+  with `log_transcripts = true`.
+- Anything running as your user can arm the listener over Quickshell's IPC
+  (`qs ipc call dorian.voice arm`), the same way the widget does. A
+  notification fires when it does, unless you turn notifications off.
+- The systemd unit is not sandboxed with `ProtectHome` and friends. It cannot
+  be: its whole job is to launch an agent CLI that reads your files.
+
+---
+
+## Install
+
+```sh
+omarchy plugin add https://github.com/dorianorellanobbap/omarchy-jarvis.git --enable
+~/.config/omarchy/plugins/dorian.voice/install.sh
 ```
 
-### Restarting
+Or from a clone:
 
-```bash
-./daemon/jarvis-daemon restart
+```sh
+git clone https://github.com/dorianorellanobbap/omarchy-jarvis.git
+cd omarchy-jarvis && ./install.sh
 ```
 
-### Checking Status
+The script builds a Python venv, fetches and checksums the piper voice (63MB),
+installs a systemd **user** unit, writes a starter config, and verifies the
+result. It is idempotent, so re-run it any time. Then add the **Voice Assistant**
+widget to your bar and log out and back in.
 
-```bash
-./daemon/jarvis-daemon status
+The unit is installed but **not enabled**: nothing holds the mic open until you
+arm it from the widget. If you want it armed from login, that is an explicit
+`systemctl --user enable jarvis`.
+
+**Requires:** Python 3.11+, PipeWire (`pw-record`/`pw-play`),
+`voxtype` (ships with Omarchy), and the CLI of whichever agent you pick.
+
+## Use
+
+| Click | Does |
+| --- | --- |
+| Left | Open the settings panel |
+| Right | Step the Basic/Full toggle |
+| Middle | Restart the listener |
+
+Armed, it costs about 3% of one core. Say the wake word, wait for the chime,
+then talk. The widget icon shows where it is: waiting, listening, thinking,
+speaking.
+
+```sh
+J=~/.local/share/jarvis
+$J/bin/jarvis-config show                                # settings as JSON
+$J/venv/bin/python $J/jarvis-listen.py --agents          # what's configured
+$J/venv/bin/python $J/jarvis-listen.py --check           # verify deps
+$J/venv/bin/python $J/jarvis-listen.py --ask "hello"     # test without the mic
+journalctl --user -u jarvis -f                           # watch it work
 ```
 
-## Model Selector Usage
+## Configure
 
-The Jarvis plugin supports multiple AI models for different tasks (language understanding, speech-to-text, text-to-speech). You can switch between models using the model selector.
+The panel covers the everyday settings: agent, wake word, sensitivity, how
+long a pause ends your question, how long a question may run. Changes are
+written straight to the config file. The listener reads its config once at
+startup, so the panel restarts it for you when it is armed; when it is
+disarmed the change simply applies next time you arm it.
 
-### Available Model Types
+Everything else lives in `~/.config/jarvis/config.toml`. See
+[`config/config.toml.example`](config/config.toml.example) for every option,
+commented.
 
-1. **Language Models (LLM)**: For understanding commands and generating responses
-2. **Speech-to-Text (STT)**: For converting your voice to text
-3. **Text-to-Speech (TTS)**: For converting responses to voice
+```toml
+agent     = "claude"        # the shipped preset
+wake_word = "hey_jarvis"    # or alexa, hey_mycroft, hey_marvin
+```
 
-### Switching Models
+Hand-edit it freely: writes from the panel go through `jarvis-config`, which
+rewrites a single line and leaves the rest of the file, comments included,
+exactly as you wrote it. It also refuses to touch anything under `[agents.*]`,
+so no click in the panel can change the command the daemon executes.
 
-You can switch models in two ways:
+### Adding an agent
 
-1. **Through Configuration Files**:
-   - Edit `config/models.yaml` to set your preferred models for each type
-   - Example:
-     ```yaml
-     llm:
-       active: "llama2-7b-chat"
-       options:
-         llama2-7b-chat:
-           type: "llama.cpp"
-           path: "./models/llama2-7b-chat.Q4_K_M.gguf"
-         mistral-7b:
-           type: "llama.cpp"
-           path: "./models/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
-     stt:
-       active: "whisper-base"
-       # ... similar structure
-     tts:
-       active: "coqui-tts"
-       # ... similar structure
-     ```
-   - After changing the configuration, restart the daemon for changes to take effect.
+`command` is argv, never a shell string, so nothing you say can be interpreted
+as shell. Three placeholders are substituted into individual arguments:
 
-2. **Through Voice Commands** (if enabled):
-   - Say "Jarvis, switch to [model name]" to change the active model for a specific task
-   - Example: "Jarvis, switch to mistral-7b for language model"
-   - The system will confirm the switch and reload the model.
+| Placeholder | Becomes |
+| --- | --- |
+| `{system}` | the voice-style system prompt Jarvis builds |
+| `{outfile}` | a temp file. If present, the reply is read from there instead of stdout |
+| `{prompt}` | what you said, transcribed. **Leave it out** (both presets do) and the transcript is fed to the CLI on stdin instead, keeping it out of the process list. Name neither `{prompt}` nor `{system}` and stdin gets both, system prompt first |
 
-### Adding Custom Models
+```toml
+[agents.mycli]
+command = ["mycli", "--quiet", "{system}\n\n{prompt}"]
+actions = false
+```
 
-1. Place your model files in the `models/` directory
-2. Add an entry to the appropriate section in `config/models.yaml`
-3. Restart the daemon
+Use `{outfile}` when the CLI prints progress logs to stdout, or
+`strip_prefixes = ["INFO", "Loading"]` to drop noise lines. Then check it with
+`--agents` and `--ask`. **PRs adding a working preset are welcome.**
 
-## Troubleshooting
+`actions = true` works with any CLI: acting is reply parsing, not a tool
+grant. The agent asks by ending its reply with a `<<jarvis:open-… >>`
+directive line, and the daemon brokers it through `jarvis-open`. The CLI
+needs no tool support at all, and none of the presets pass any tool flags.
 
-- **No audio output**: Check your audio settings in `config/audio.yaml` and ensure your speakers are not muted.
-- **Wake word not detected**: Adjust the sensitivity in `config/wake_word.yaml` or check your microphone input.
-- **Model loading errors**: Ensure you have enough RAM/VRAM and that the model files are correctly placed and formatted.
-- **High CPU usage**: Consider using a smaller model or enabling GPU acceleration if available.
+`web_command` is the one exception, and it is opt-in: web search only works
+with a CLI that can grant a read-only search tool by flag (Claude Code can).
+A CLI that cannot simply stays search-less -- do not reach for a fetch tool
+or a shell to fake it; the daemon will warn, and a hostile page would thank
+you.
 
-## Support
+## How it works
 
-For issues and feature requests, please visit the project's issue tracker.
+```
+mic ──> openWakeWord ──> [wake word] ──> record until silence
+                                              │
+                                         voxtype (local whisper)
+                                              │
+                                          agent CLI
+                                              │
+                                       piper ──> speakers
+```
 
-Enjoy your Jarvis voice assistant!
+Pipeline state is written to `$XDG_RUNTIME_DIR/jarvis/state`, so the widget
+reads a file instead of talking to the process.
+
+The settings panel is QML and the daemon's config is TOML, which QML cannot
+parse. Rather than teach the widget about TOML, or move the settings somewhere
+the daemon would need Omarchy to read them, the panel shells out to
+`jarvis-config`, which prints JSON and writes single lines.
+
+## Notes from building it
+
+- An always-on mic forces AirPods into mono HFP. Pin your default source to
+  the internal mic if that bites.
+- `pw-record` exits early if its stderr is `DEVNULL`. It needs a real file.
+- While the agent is thinking, nothing drains the mic pipe, so it holds stale
+  audio including Jarvis's own reply. The stream is restarted after every
+  exchange rather than replayed.
+
+## Uninstall
+
+```sh
+./uninstall.sh          # keeps your config
+./uninstall.sh --purge  # removes it too
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

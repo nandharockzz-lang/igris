@@ -712,6 +712,24 @@ def capability_label(agent):
     return "can act" if agent.actions else "answer-only"
 
 
+def _model_listed(model_id, timeout=15):
+    """Best-effort membership probe against `opencode models`.
+
+    Returns None when opencode could not be asked at all (missing, slow,
+    failing) -- startup must never depend on a probe -- else whether
+    model_id is listed.
+    """
+    try:
+        import subprocess
+        proc = subprocess.run(["opencode", "models"], capture_output=True,
+                              text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return any(line.strip() == model_id for line in proc.stdout.splitlines())
+
+
 def select_agent(cfg):
     """Resolve cfg['agent'] to an Agent, failing loudly on a bad name."""
     name = cfg.get("agent", "claude")
@@ -724,6 +742,34 @@ def select_agent(cfg):
     except ValueError as exc:
         # A clean message, not a traceback, for systemd's restart loop to log.
         raise SystemExit(f"[jarvis] {exc}")
+    # The top-level `model` key selects the OpenCode model for opencode-voice
+    # (the panel Model dropdown writes it). Injected here so config and daemon
+    # agree without the panel having to know agent argv shapes.
+    if name == "opencode-voice":
+        model_setting = cfg.get("model")
+        if not model_setting:
+            log("warning: no model configured for opencode-voice; "
+                "pick one in the panel")
+        else:
+            for template in (agent.command, agent.web_command or []):
+                try:
+                    idx = template.index("--agent")
+                except ValueError:
+                    log(f"warning: agent '{name}' argv has no '--agent'; "
+                        "cannot inject the configured model")
+                    break
+                if len(template) < idx + 2:
+                    log(f"warning: agent '{name}' argv has no agent name "
+                        "after '--agent'; cannot inject the configured model")
+                    break
+                template.insert(idx + 2, "-m")
+                template.insert(idx + 3, model_setting)
+            # Advisory only: hard validation lives in `jarvis-config set
+            # model` behind the panel. A hiccup in `opencode models` must
+            # never kill the mic, so an unaskable probe stays silent.
+            if _model_listed(model_setting) is False:
+                log(f"warning: configured model '{model_setting}' is not "
+                    "listed by `opencode models`; continuing anyway")
     if shutil.which(agent.executable) is None:
         log(f"warning: '{agent.executable}' is not on PATH -- replies will fail")
     # Both argv templates, not just the first: web_command carries a search

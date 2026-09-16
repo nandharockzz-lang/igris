@@ -106,6 +106,20 @@ PanelWindow {
         }
     }
 
+    // Ask the service to re-open the card on demand (right-click).
+    signal peekRequested()
+
+    // Single left-click is delayed so a double-click never also toggles:
+    // left = arm/step mode, right = peek the card, double-left = disarm.
+    Timer {
+        id: clickTimer
+        interval: 260
+        repeat: false
+        onTriggered: {
+            if (dragArea.draggedPx <= 5) toggleMode()
+        }
+    }
+
     MouseArea {
         id: dragArea
         anchors.fill: parent
@@ -133,13 +147,12 @@ PanelWindow {
         }
         onClicked: function(mouse) {
             if (draggedPx > 5) return
-            if (mouse.button === Qt.RightButton) disarm()
-            else toggleMode()
+            if (mouse.button === Qt.RightButton) root.peekRequested()
+            else clickTimer.restart()
         }
         onDoubleClicked: {
-            if (root.pipeline === "idle" || root.pipeline === "off") {
-                toggleMode()
-            }
+            clickTimer.stop()
+            disarm()
         }
     }
 
