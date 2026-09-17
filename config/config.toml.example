@@ -4,15 +4,13 @@
 # Which agent below answers. Must match an [agents.*] section.
 agent = "claude"
 
-# Wake word. Only models actually installed are selectable: the shipped
-# openWakeWord ones (hey_jarvis, alexa, hey_mycroft, hey_marvin, plus timer
-# and weather), plus anything in ~/.local/share/jarvis/wake-models/.
-# "igris" names that custom slot -- train or download igris_v0.1.onnx there
-# (jarvis-config install-wake-word igris <file> validates it loads), then
-# select it. A name with no model file is refused everywhere: the panel,
-# jarvis-config set, and daemon startup -- the prior working wake word is
-# kept and the reason lands in the runtime startup_error file, never in a
-# restart loop.
+# Wake word. Only models actually installed are selectable (panel and
+# jarvis-config list installed files only). Shipped openWakeWord names:
+# hey_jarvis, alexa, hey_mycroft, hey_marvin. Custom models go in
+# ~/.local/share/jarvis/wake-models/ — e.g. train/download igris_v0.1.onnx
+# then `jarvis-config install-wake-word igris <file>` before selecting it.
+# A name with no model file is refused at set/startup; the prior wake word
+# is kept and the reason lands in the runtime startup_error file.
 wake_word = "hey_jarvis"
 
 # Piper voice file, relative to ~/.local/share/jarvis/voices/ or absolute.
@@ -105,7 +103,7 @@ cooldown       = 1.0   # ignore the wake word this long after replying
 # own voxtype config (your keys), never the jarvis-owned one.
 # ---------------------------------------------------------------------------
 [stt]
-engine = "whisper"   # whisper today; parakeet once voxtype ships an ONNX build
+engine = "whisper"   # whisper only (verified). Parakeet needs JARVIS_EXPERIMENTAL_STT=1
 model = "base.en"    # whisper: tiny|tiny.en|base|base.en|small|small.en|...
 language = "en"
 # Short command-vocabulary bias (whisper initial prompt): broker verbs and

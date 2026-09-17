@@ -12,6 +12,10 @@ import qs.Ui
 // restarts. Tapping the panel avatar disarms.
 // Pipeline state comes from small files the daemon writes, which keeps this
 // widget from having to talk to the process at all.
+//
+// Wake / listen / speak feedback lives on the bar Avatar itself (and on the
+// persistent console in service.qml). A second overlay avatar here used to
+// duplicate that signal; it was removed so the bar stays a single control.
 BarWidget {
   id: root
   moduleName: "dorian.voice"
@@ -35,43 +39,24 @@ BarWidget {
   property int remainingSecs: 0
   property bool busy: false
 
-// UI telemetry (daemon-published numbers only -- never audio or words).
-   property real voiceLevel: 0
-   property var micBars: []
-   property string toolCat: ""
-   property double toolAt: 0
-   property double wakeAt: 0
-   property bool blink: false
-   property real bob: 0
-   // Freshness flags, refreshed every second by the poll timer (bindings
-   // alone cannot observe wall-clock passing).
-   property bool wakeFresh: false
-   property bool toolFresh: false
-// Visual overlay avatar state
-    property bool showOverlay: false
-    property bool overlayWake: false
-    property bool overlayToggle: false
-    property string overlayAvatarState: "off"
-    property real overlayVoiceLevel: 0
-    property bool overlayBlink: false
-    property real overlayBob: 0
+  // UI telemetry (daemon-published numbers only -- never audio or words).
+  property real voiceLevel: 0
+  property var micBars: []
+  property string toolCat: ""
+  property double toolAt: 0
+  property double wakeAt: 0
+  property bool blink: false
+  property real bob: 0
+  // Freshness flags, refreshed every second by the poll timer (bindings
+  // alone cannot observe wall-clock passing).
+  property bool wakeFresh: false
+  property bool toolFresh: false
 
-function refreshFreshness() {
+  function refreshFreshness() {
     var now = Date.now() / 1000
     root.wakeFresh = root.wakeAt > 0 && (now - root.wakeAt) < 2
     root.toolFresh = root.toolAt > 0 && (now - root.toolAt) < 4
-    // Determine if overlay should be showing based on wake word detection (within 2 seconds)
-    var wakeBasedOverlay = root.wakeAt > 0 && (now - root.wakeAt) < 2
-    root.overlayWake = wakeBasedOverlay
-    // If overlay should be visible from either wake word or toggle, update its properties to match current avatar state
-    if (root.overlayWake || root.overlayToggle) {
-        // Update overlay avatar properties to match current avatar state
-        root.overlayAvatarState = root.avatarState
-        root.overlayVoiceLevel = root.voiceLevel
-        root.overlayBlink = root.blink
-        root.overlayBob = root.bob
-    }
-}
+  }
 
   readonly property bool armed: serviceState === "active"
   readonly property bool failed: serviceState === "failed"
@@ -355,20 +340,21 @@ function refreshFreshness() {
     onTriggered: root.bob = root.bob === 0 ? 1.1 : 0
   }
 
-IpcHandler {
-     target: "dorian.voice"
+  IpcHandler {
+    target: "dorian.voice"
 
-     function arm(): void { if (!root.armed) root.startNow() }
-     function disarm(): void { if (root.armed) root.stopNow() }
-     function toggleArmed(): void { root.toggle() }
-     function cycle(): void { root.toggle() }
-     function restart(): void { root.restart() }
-     function settings(): void { root.togglePanel() }
-     function toggle(): void { root.togglePanel() }
-     function open(): void { root.open() }
-     function close(): void { root.close() }
-     function toggleOverlay(): void { root.overlayToggle = !root.overlayToggle }
-   }
+    function arm(): void { if (!root.armed) root.startNow() }
+    function disarm(): void { if (root.armed) root.stopNow() }
+    function toggleArmed(): void { root.toggle() }
+    function cycle(): void { root.toggle() }
+    function restart(): void { root.restart() }
+    function settings(): void { root.togglePanel() }
+    function toggle(): void { root.togglePanel() }
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    // Kept for IPC compat; wake feedback is on the bar Avatar / service console.
+    function toggleOverlay(): void {}
+  }
 
   WidgetButton {
     id: button
@@ -397,36 +383,13 @@ IpcHandler {
       highContrast: root.highContrast
     }
 
-// Left opens the panel, matching every other bar widget. Right steps
-     // the Basic/Full toggle; middle restarts. Tapping the panel avatar
-     // disarms -- see Panel.qml.
-     onPressed: function(b) {
-       if (b === Qt.RightButton) root.toggle()
-       else if (b === Qt.MiddleButton) root.restart()
-       else root.togglePanel()
-     }
-   }
-
-// Visual overlay avatar that appears when wake word is detected
-    Item {
-      id: overlayAvatar
-      visible: root.overlayWake || root.overlayToggle
-      anchors.fill: parent
-      
-      Behavior on opacity {
-        PropertyAnimation { duration: 200; easing.type: Easing.InOutQuad }
-      }
-      
-      Avatar {
-        anchors.centerIn: parent
-        side: Math.max(24, Math.min(parent.width, parent.height) * 0.3)
-        state: root.overlayAvatarState
-        mode: root.mode
-        level: root.overlayVoiceLevel
-        blink: root.overlayBlink
-        bob: root.overlayBob
-        reduceMotion: root.reduceMotion
-        highContrast: root.highContrast
-      }
+    // Left opens the panel, matching every other bar widget. Right steps
+    // the Basic/Full toggle; middle restarts. Tapping the panel avatar
+    // disarms -- see Panel.qml.
+    onPressed: function(b) {
+      if (b === Qt.RightButton) root.toggle()
+      else if (b === Qt.MiddleButton) root.restart()
+      else root.togglePanel()
     }
- }
+  }
+}

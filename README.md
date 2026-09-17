@@ -62,23 +62,23 @@ A mode toggle is one keybinding away in `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("SUPER + SHIFT + J", "Jarvis Basic/Full toggle",
-       "/home/sicarius/.local/share/jarvis/bin/jarvis-toggle")
+       os.getenv("HOME") .. "/.local/share/jarvis/bin/jarvis-toggle")
 ```
 
-(Adjust the home directory to yours: that is where `install.sh` puts the
-helper.) Stopped -> Basic -> Full -> stopped. Arming also flips the broker
-verbs flag on for the selected voice agent (and disarming flips it back, so
-Safe can never refuse startup); hand-editing `actions` still works but the
-toggle will manage it from then on. The hotkey only *requests*: the daemon
-validates every transition and owns the state, so a refused combination
-surfaces as an error instead of switching. A second press on Full disarms
-immediately and stops new tool calls.
+(`install.sh` installs the helper under `~/.local/share/jarvis/bin/`.)
+Stopped -> Basic -> Full -> stopped. Arming Basic or Full also sets
+`actions = true` so broker verbs work; disarming (back to stopped / Safe)
+sets `actions = false` so Safe can never refuse startup. Hand-editing
+`actions` still works, but the toggle will manage it from then on. The
+hotkey only *requests*: the daemon validates every transition and owns the
+state, so a refused combination surfaces as an error instead of switching.
+A second press on Full disarms immediately and stops new tool calls.
 
 Panic stays separate, on `SUPER + SHIFT + K`:
 
 ```lua
 o.bind("SUPER + SHIFT + K", "Jarvis panic (stop everything)",
-       "/home/sicarius/.local/share/jarvis/bin/jarvis-rollback --panic")
+       os.getenv("HOME") .. "/.local/share/jarvis/bin/jarvis-rollback --panic")
 ```
 
 That stops the listener, terminates tracked privileged runs, and clears the
@@ -90,25 +90,24 @@ toggle with a mouse, and tapping the panel avatar disarms.
 workspaces, mute, media transport keys, YouTube search-and-play, and your
 own library (`mymusic liked|watchlater|playlist NAME`, opened logged-in in
 your default browser with zero credentials on our side) -- on an explicit
-arm window (30 min default) with no shell, no files, no tools. Set
-`player = "mpv"` under `[music]` and songs play as audio with no window at
-all (`"mpv-video"` for a small always-on-top window instead); pause, resume,
-skip and closing the player keep working through the media verb
-("pause", "next", "quit the music"). no files, no tools. Routine
-commands ("play X", "pause", "volume up") never reach the model: the daemon
-matches them locally and runs the same broker, so they answer in about a
-second; anything ambiguous falls through to the assistant.
-no files, no tools. `Full` (privileged) adds sandboxed full-tools on a short
-5-minute window with a visible countdown; destructive operations always need
-a keyboard/button confirmation -- voice may announce Full mode but never
-authorizes destruction. The widget shows an anime avatar (ring: blue Safe,
-green Basic, orange Full, gray mic-off, red error), a mode badge with
-countdown, a live mic EQ while listening, and a tool-category chip while
-working. Mouth movement follows real Piper playback amplitude; the EQ follows
-live gated mic levels and dims when listening ends. Tapping the panel avatar
-disarms. Reduced-motion and high-contrast options live in the widget
-settings. None of this changes permissions: the daemon enforces every mode
-invariant exactly as before.
+arm window (30 min default) with no shell, no files, and no agent tools.
+Set `player = "mpv"` under `[music]` and songs play as audio with no window
+at all (`"mpv-video"` for a small always-on-top window instead); pause,
+resume, skip and closing the player keep working through the media verb
+("pause", "next", "quit the music"). Routine commands ("play X", "pause",
+"volume up") never reach the model: the daemon matches them locally and
+runs the same broker, so they answer in about a second; anything ambiguous
+falls through to the assistant. `Full` (privileged) adds sandboxed
+full-tools on a short 5-minute window with a visible countdown; destructive
+operations always need a keyboard/button confirmation -- voice may announce
+Full mode but never authorizes destruction. The widget shows an anime
+avatar (ring: blue Safe, green Basic, orange Full, gray mic-off, red
+error), a mode badge with countdown, a live mic EQ while listening, and a
+tool-category chip while working. Mouth movement follows real Piper
+playback amplitude; the EQ follows live gated mic levels and dims when
+listening ends. Tapping the panel avatar disarms. Reduced-motion and
+high-contrast options live in the widget settings. None of this changes
+permissions: the daemon enforces every mode invariant exactly as before.
 
 **Rollback** is `jarvis-rollback`: it terminates tracked privileged runs
 first (config edits alone could never stop them), clears the arm state, sets
@@ -131,16 +130,20 @@ Two more things worth knowing:
 
 ## Install
 
+This tree is the **igris** fork of Omarchy Jarvis. The Omarchy plugin id
+remains `dorian.voice` so bar widgets and IPC (`qs ipc call dorian.voice …`)
+keep working.
+
 ```sh
-omarchy plugin add https://github.com/dorianorellanobbap/omarchy-jarvis.git --enable
+omarchy plugin add https://github.com/nandharockzz-lang/igris.git --enable
 ~/.config/omarchy/plugins/dorian.voice/install.sh
 ```
 
 Or from a clone:
 
 ```sh
-git clone https://github.com/dorianorellanobbap/omarchy-jarvis.git
-cd omarchy-jarvis && ./install.sh
+git clone https://github.com/nandharockzz-lang/igris.git
+cd igris && ./install.sh
 ```
 
 The script builds a Python venv, fetches and checksums the piper voice (63MB),
@@ -238,12 +241,18 @@ you.
 
 ## How it works
 
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the module layout. Pipeline sketch:
+
 ```
 mic ──> openWakeWord ──> [wake word] ──> record until silence
                                               │
                                          voxtype (local whisper)
                                               │
+                                    local routine? ── yes ──> jarvis-open
+                                              │ no
                                           agent CLI
+                                              │
+                                    directives? ──> jarvis-open
                                               │
                                        piper ──> speakers
 ```
@@ -268,8 +277,10 @@ the daemon would need Omarchy to read them, the panel shells out to
 ## Uninstall
 
 ```sh
-./uninstall.sh          # keeps your config
-./uninstall.sh --purge  # removes it too
+./uninstall.sh          # keeps your config (prompts)
+./uninstall.sh -y       # non-interactive; keeps config
+./uninstall.sh --purge  # removes config too
+./uninstall.sh -y --purge
 ```
 
 ## License

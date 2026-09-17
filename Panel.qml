@@ -66,6 +66,7 @@ property string wakeWord: ""
    // configured wake word, and the last startup refusal, if any.
    property string sttEngine: ""
    property string sttModel: ""
+   property bool sttCloudFallback: false
    property string startupError: ""
    property bool loaded: false
    property string errorText: ""
@@ -218,6 +219,7 @@ command: [root.helper, "show"]
           if (d.stt) {
             root.sttEngine = d.stt.engine || ""
             root.sttModel = d.stt.model || ""
+            root.sttCloudFallback = d.stt.cloud_fallback === true
           }
           root.startupError = d.startup_error || ""
           root.agents = d.agents || []
@@ -920,11 +922,23 @@ Dropdown {
 
           Text {
             width: parent.width
+            visible: root.sttCloudFallback
+            text: "Cloud STT fallback is ON: empty local transcripts send audio off this machine. Set stt.cloud_fallback = false in the config file to keep speech local."
+            color: "#f0883e"
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            width: parent.width
             text: (root.sttEngine !== "" && root.sttModel !== "")
               ? "Listener: " + root.sttEngine + "/" + root.sttModel
                 + (root.wakeWord !== "" ? " · wake " + root.wakeWord.replace(/_/g, " ") : "")
-                + "\nEverything else (adding an agent, the voice) lives in the config file."
-              : "Everything else (adding an agent, the voice) lives in the config file."
+                + "\nAnything running as your user can arm the mic (`qs ipc call dorian.voice arm`). "
+                + "Everything else (adding an agent, the voice) lives in the config file."
+              : "Anything running as your user can arm the mic (`qs ipc call dorian.voice arm`). "
+                + "Everything else (adding an agent, the voice) lives in the config file."
             color: Qt.darker(root.fg, 1.4)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

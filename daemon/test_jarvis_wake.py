@@ -118,14 +118,15 @@ class StartupErrorTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="jarvis-serr-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        err = os.path.join(self.tmp, "startup_error")
         self.p_state = mock.patch.object(jl, "STATE_DIR", self.tmp)
-        self.p_file = mock.patch.object(jl, "STARTUP_ERROR_FILE",
-                                         os.path.join(self.tmp,
-                                                      "startup_error"))
-        self.p_state.start()
-        self.p_file.start()
-        self.addCleanup(self.p_state.stop)
-        self.addCleanup(self.p_file.stop)
+        self.p_file = mock.patch.object(jl, "STARTUP_ERROR_FILE", err)
+        self.p_ux_state = mock.patch.object(jl.ux_state, "STATE_DIR", self.tmp)
+        self.p_ux_file = mock.patch.object(jl.ux_state, "STARTUP_ERROR_FILE",
+                                           err)
+        for p in (self.p_state, self.p_file, self.p_ux_state, self.p_ux_file):
+            p.start()
+            self.addCleanup(p.stop)
 
     def test_note_and_clear_roundtrip(self):
         jl.note_startup_error("[jarvis] wake_word 'nope' is not installed.")
@@ -158,14 +159,14 @@ class ConfigValidateTests(unittest.TestCase):
                                return_value={"alexa": ("/p", "s")}):
             jcfg.validate(jl, "wake_word", "alexa", "/nonexistent.toml")
 
-    def test_show_lists_installed_flags(self):
+    def test_show_lists_installed_only(self):
         with mock.patch.object(jl, "wake_models",
                                return_value={"alexa": ("/p", "s")}):
             out = jcfg.wake_word_list(jl)
         by_name = {e["name"]: e["installed"] for e in out}
         self.assertTrue(by_name["alexa"])
-        self.assertFalse(by_name.get("igris", True))
-        self.assertIn("hey_jarvis", by_name)  # known name, flagged
+        self.assertNotIn("igris", by_name)  # uninstalled custom wake hidden
+        self.assertNotIn("hey_jarvis", by_name)  # not in this mock install set
 
 
 class InstallTests(unittest.TestCase):

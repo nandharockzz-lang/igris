@@ -35,10 +35,53 @@ import wave
 
 import numpy as np
 
-# Next to this file, in the repo and in ~/.local/share/jarvis alike.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Repo flat layout or install-time lib/: shared modules live next to this
+# file during development, and under $JARVIS_DIR/lib after install.sh.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _c in (_HERE, os.path.join(_HERE, "lib"),
+           os.path.join(os.path.dirname(_HERE), "lib")):
+    _abs = os.path.abspath(_c)
+    if os.path.isfile(os.path.join(_abs, "safefile.py")):
+        if _abs not in sys.path:
+            sys.path.insert(0, _abs)
+        break
+else:
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
+try:
+    import jarvis_libpath
+    jarvis_libpath.ensure()
+except ImportError:
+    pass
 import safefile
 import actions  # versioned local-action contract (grammar, confirmation)
+import agent_posture
+import routines
+import ux_state
+
+# Re-export extracted modules so tests and jarvis-config keep using jl.*.
+from agent_posture import (  # noqa: E402
+    ACTIONS_PROMPT, Agent, DEFAULTS, GROK_DEFAULT_MODEL, GROK_DISALLOWED_TOOLS,
+    GROK_DISALLOWED_TOOLS_ARG, KNOWN_CLIS, NO_TOOLS_PROMPT, OPENCODE_DENY_KEYS,
+    STYLE_PROMPT, TOOLS_DENIED, TOOLS_GRANTED, TOOLS_UNKNOWN, WEB_PROMPT,
+    WEB_TURN_PROMPT, agent_cwd, capability_label, check_mode_invariants,
+    grants_tools, grok_tools_denied, inject_model_flag, jarvis_agent_run_path,
+    merge, opencode_agent_name, opencode_frontmatter_denies, select_agent,
+    tool_posture,
+)
+from ux_state import (  # noqa: E402
+    AGENT_CWD, ARM_FILE, CUSTOM_WAKE_DIR, JARVIS_VOX_CONFIG, LEVEL_FILE,
+    MIC_BUCKETS, MIC_FILE, MODE_FILE, MODES, REQUEST_FILE, RESPONSE_FILE,
+    STARTUP_ERROR_FILE, STATE_DIR, STATE_FILE, TOOL_FILE, UI_TEXT_LIMIT,
+    WAKE_FILE, arm_active, clear_startup_error, clear_ui_text, current_mode,
+    note_startup_error, note_wake, publish_mic, publish_tool, publish_ui_text,
+    read_arm_deadline, rms_to_100, set_level, set_state, workspace_timeout,
+    _wav_envelope,
+)
+from routines import (  # noqa: E402
+    MUSIC_QUERY_RE, PENDING_CONFIRM, ROUTINE_CONFIRM, match_routine_intent,
+    match_routine_intents, _command_words,
+)
 
 HOME = os.path.expanduser("~")
 JARVIS_DIR = os.path.join(HOME, ".local", "share", "jarvis")
@@ -59,10 +102,11 @@ CHUNK_BYTES = CHUNK_SAMPLES * 2
 WAKE_WORDS = ("hey_jarvis", "alexa", "hey_mycroft", "hey_marvin", "igris")
 
 # Speech engines Jarvis can drive through `voxtype transcribe --engine`.
-# Only whisper is verified against this voxtype binary today (parakeet and
-# friends need an ONNX-variant rebuild); parakeet stays listed so the
-# config layer -- and the benchmark -- already speak its names.
-STT_ENGINES = ("whisper", "parakeet")
+# Only whisper is verified against the current voxtype binary. Parakeet
+# model names stay known for tools/stt-bench.py and for opt-in via
+# JARVIS_EXPERIMENTAL_STT=1; the panel and default config path refuse it.
+STT_ENGINES = ("whisper",)
+STT_ENGINES_EXPERIMENTAL = ("parakeet",)
 WHISPER_MODELS = ("tiny", "tiny.en", "base", "base.en", "small", "small.en",
                   "medium", "medium.en", "large-v3", "large-v3-turbo")
 PARAKEET_MODELS = ("parakeet-tdt-0.6b-v2", "parakeet-tdt-0.6b-v2-int8",
@@ -70,259 +114,6 @@ PARAKEET_MODELS = ("parakeet-tdt-0.6b-v2", "parakeet-tdt-0.6b-v2-int8",
                    "parakeet-unified-en-0.6b")
 VOXTYPE_MODELS_DIR = os.path.join(os.path.expanduser("~"), ".local", "share",
                                   "voxtype", "models")
-
-# Grok Build (grok CLI) --tools "" is NOT an empty allowlist: empty is
-# treated as unset and every built-in stays. The voice preset must name
-# every filesystem/shell/web tool in --disallowed-tools. tool_posture
-# requires this set before it will call the invocation answer-only.
-GROK_DISALLOWED_TOOLS = (
-    "read_file", "search_replace", "grep", "list_dir",
-    "run_terminal_cmd", "run_terminal_command",
-    "web_search", "web_fetch", "todo_write",
-    "spawn_subagent", "memory_search", "Agent",
-)
-GROK_DISALLOWED_TOOLS_ARG = ",".join(GROK_DISALLOWED_TOOLS)
-GROK_DEFAULT_MODEL = "grok-4.6"
-
-DEFAULTS = {
-    "agent": "claude",
-    "wake_word": "hey_jarvis",
-    "voice": "en_US-amy-medium.onnx",
-    # What you say near an open microphone can carry secrets, and journald
-    # persists what we print. Off means the journal records sizes and
-    # outcomes, never the words.
-    "log_transcripts": False,
-    # Explicit mode, not a prompt promise. Safe is the only mode allowed for
-    # always-on wake-word listening: agent=opencode-voice (all tools denied
-    # in its agent file) or a CLI-verified answer-only preset, actions=false.
-    # Workspace ("Basic" in the UI) is an explicit physical action only
-    # (hotkey / push-to-talk --ask / widget arm) with auto-disarm; it unlocks
-    # the deterministic broker verbs and nothing else. Privileged ("Full")
-    # adds sandboxed full-tools behind the jarvis-agent-run wrapper plus a
-    # button/keyboard confirmation for anything destructive -- voice never
-    # authorizes that. Basic gets the longer window because its risk surface
-    # is broker verbs only; Full keeps the short one.
-    "mode": "safe",
-    "workspace": {
-        "auto_disarm_seconds": 1800,
-        "full_disarm_seconds": 300,
-    },
-    "listen": {
-        "wake_threshold": 0.5,
-        "silence_tail": 1.2,
-        "min_speech": 0.4,
-        "max_command": 15.0,
-        "cooldown": 1.0,
-    },
-    "draggable_avatar_enabled": True,
-    "stt": {
-        "engine": "whisper",
-        # Benchmark (14 TTS + 14 mic phrases, this CPU): base.en and
-        # small.en tie on accuracy (WER 0.058) while base.en answers in
-        # 1.3s vs 8.2s. Bigger is not better here; revisit after the
-        # parakeet comparison.
-        "model": "base.en",
-        "language": "en",
-        # Command-vocabulary bias for whisper's initial prompt. Short nouns
-        # and verbs from the broker grammar, not sentences. Whisper otherwise
-        # prefers common English ("player") over command English ("play").
-        "vocabulary": (
-            "play pause open launch start run terminal chromium firefox "
-            "browser files workspace next previous volume mute unmute "
-            "brightness screenshot lock music youtube discord settings "
-            "calculator close window jarvis foot"
-        ),
-        # Opt-in cloud fallback for empty local transcripts. Off by
-        # default: local-first, and a cloud engine sends audio off-machine.
-        "cloud_fallback": False,
-        "fallback_engine": "soniox",
-    },
-    "agents": {
-        "claude": {
-            # No {prompt} in argv: the transcript is fed to `claude -p` on
-            # stdin, where it is not readable out of the process list.
-            #
-            # The tool flags are the deny boundary, and both are load-bearing.
-            # Passing no tool flags at all is *not* answer-only: `claude -p`
-            # still exposes its built-in read tools, and still loads whatever
-            # MCP servers the user's own configuration defines, so a sentence
-            # spoken near the mic could read local files through an agent we
-            # meant to be a text box. `--tools ""` is the CLI's empty built-in
-            # allowlist, and `--strict-mcp-config` with no accompanying
-            # --mcp-config loads no MCP servers, so an inherited user or
-            # project config cannot put tools back. With actions = true the
-            # daemon parses a strictly validated <<jarvis:open-...>> directive
-            # out of the reply text and execs the jarvis-open broker itself,
-            # so there is still never a tool grant to aim at.
-            "command": ["claude", "-p",
-                        "--tools", "", "--strict-mcp-config",
-                        "--append-system-prompt", "{system}"],
-            # Off unless the config says otherwise. Letting a sentence spoken
-            # near the mic open apps and URLs is a decision the person
-            # installing this should make on purpose, not one they inherit
-            # from a default. It also means these DEFAULTS stay safe as a
-            # fallback: an unreadable config drops back to here, and dropping
-            # back should never quietly grant more than was granted before.
-            "actions": False,
-        },
-        # Grok Build CLI. Prompt on stdin via --prompt-file /dev/stdin so
-        # the transcript is not in argv. --tools "" is NOT a deny on this
-        # CLI (empty is treated as unset); --disallowed-tools must name
-        # every filesystem/shell/web tool. Canary: a disposable file's
-        # contents must not come back from --ask. Re-run after upgrades.
-        "grok": {
-            "command": [
-                "grok",
-                "--prompt-file", "/dev/stdin",
-                "--output-format", "plain",
-                "--effort", "low",
-                "--max-turns", "1",
-                "--no-plan",
-                "--no-subagents",
-                "--disable-web-search",
-                "--disallowed-tools", GROK_DISALLOWED_TOOLS_ARG,
-                "--system-prompt-override", "{system}",
-            ],
-            "actions": False,
-            "timeout": 180,
-        },
-    },
-}
-
-# The voice-style half of the system prompt. Always sent.
-STYLE_PROMPT = (
-    "You are a voice assistant. Your reply will be read aloud by a "
-    "text-to-speech engine, so answer in at most three short sentences of "
-    "plain spoken English. No markdown, no lists, no code blocks, no URLs."
-)
-
-# Sent whenever the invocation grants the CLI no tools, which is what the
-# shipped presets do. Without it the model does not know its tools are gone:
-# it answers a "read this file" with tool-call syntax, which is then read
-# aloud as punctuation soup. Telling it plainly gets a plain refusal instead.
-# Left off an invocation the user has given tools to, where it would be false.
-NO_TOOLS_PROMPT = (
-    "You have no tools in this conversation. You cannot read or write files, "
-    "run commands, or browse. If answering would need one, say so in a short "
-    "spoken sentence. Never write out a tool call (no XML tags, no "
-    "function-call JSON). A <<jarvis:...>> line at the end of your reply is "
-    "how you ask Jarvis to act -- that is not a tool call, and it is not "
-    "markup to skip."
-)
-
-# The actions half. Only sent to agents configured with actions = true. The
-# agent is never given a tool or a shell: it asks for an action by ending its
-# reply with one directive line, and the daemon decides whether anything
-# happens. See extract_directive/run_directive below. Workspace mode only:
-# Safe mode refuses to start with actions on (see check_mode_invariants).
-ACTIONS_PROMPT = (
-    "You cannot run commands, but you can ask Jarvis to open things or to "
-    "change a desktop setting. To open an installed app, add a line at the "
-    "end of your reply of exactly this form: <<jarvis:open-app NAME>>. "
-    "To open a web page in the browser: <<jarvis:open-url URL>> (http or "
-    "https only). For desktop settings, one of: <<jarvis:volume 0-100|up|"
-    "down|mute|unmute>>, <<jarvis:brightness 1-100|up|down>>, "
-    "<<jarvis:workspace NAME>>, <<jarvis:mute on|off|toggle>>. "
-    "To play music or a video, name it with words joined by plus signs: "
-    "<<jarvis:music song+name>> opens the top YouTube result straight "
-    "away. For your own library: <<jarvis:mymusic liked>>, "
-    "<<jarvis:mymusic watchlater>>, or <<jarvis:mymusic playlist NAME>> "
-    "for a playlist from your config (it opens in your logged-in browser). "
-    "To pause, resume or skip what is already playing in any media "
-    "player: <<jarvis:media toggle|play|pause|next|prev>>. To close the "
-    "mini player: <<jarvis:media quit>>. "
-    "Windows and workspaces: <<jarvis:focus-window NAME>> focuses a running "
-    "app, <<jarvis:move-window NAME TARGET>> moves it to a workspace "
-    "(number, name, next or previous), <<jarvis:workspace NAME>> (or a "
-    "number, next, previous) switches there, <<jarvis:fullscreen>> toggles "
-    "fullscreen on the focused window. Screen and capture: <<jarvis:lock>> "
-    "locks the screen, <<jarvis:screenshot>> (or <<jarvis:screenshot "
-    "window>>) saves to ~/Pictures, <<jarvis:notify TEXT>> shows a "
-    "notification. Destructive verbs exist but need the user's on-screen "
-    "tap before they run: <<jarvis:close-window>>, <<jarvis:logout>>, "
-    "<<jarvis:reboot>>, <<jarvis:poweroff>>, <<jarvis:wifi on|off>>. "
-    "Emit one directive line per action (compound requests may use more "
-    "than one) and say in your reply what they do; if the user must "
-    "confirm, say that too. "
-    "You cannot browse results, click anything, or control a page: say "
-    "so out loud if asked. "
-    "The line is stripped before your reply is spoken, "
-    "so also say in your reply what you are doing. If asked to do anything "
-    "else to the machine, say out loud that you cannot."
-)
-
-# The web half. Only sent to agents configured with a web_command. The first
-# call still runs with no tools; asking to search hands the exchange to a
-# second, search-capable invocation whose reply is treated as tainted -- see
-# run_search below.
-WEB_PROMPT = (
-    "If answering needs current information from the web, reply with only "
-    "this line and nothing else: <<jarvis:search WHAT TO LOOK UP>>. Jarvis "
-    "will run one web-enabled round and speak its answer. Do not search for "
-    "things you already know, and never combine a search line with an open "
-    "line."
-)
-
-# System prompt for the web-enabled second call. Deliberately excludes
-# ACTIONS_PROMPT and WEB_PROMPT: this call can read the open web, so it gets
-# no way to ask for anything -- no opens, no further searches.
-WEB_TURN_PROMPT = (
-    "Use your web search tool to find what the question needs, then answer "
-    "from what you found. Say plainly if the search settles nothing. Do not "
-    "read URLs aloud."
-)
-
-def _state_root():
-    """Where the pipeline-state file lives.
-
-    XDG_RUNTIME_DIR is per-user and mode 0700, so it is the right home. The
-    old fallback was tempfile.gettempdir() -- i.e. a predictable path inside a
-    world-writable /tmp, where another local user could pre-plant `state` as a
-    FIFO (blocking the bar widget's reader, which polls every second) or
-    `state.tmp` as a symlink (redirecting our write onto one of this user's
-    own files). Fall back to a directory only this user can write instead.
-    """
-    runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime:
-        return runtime
-    return os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
-
-
-STATE_DIR = os.path.join(_state_root(), "jarvis")
-STATE_FILE = os.path.join(STATE_DIR, "state")
-# Visible mode + auto-disarm deadline for the widget/panel. STATE_FILE keeps
-# its single pipeline token for compatibility; these sit beside it. All are
-# daemon-published numbers/tokens only -- never transcripts, audio, or args:
-#   mode       safe|workspace|privileged (authoritative; panel reflects it)
-#   armed_until  epoch seconds when a non-safe window ends
-#   wake       epoch seconds of the last wake-word detection (2s flash)
-#   level      "0-100 epoch" playback amplitude (10Hz while speaking)
-#   mic        12 gated mic-amplitude buckets + epoch (10Hz while listening)
-#   tool       "<category> <epoch>" of the last broker/search attempt
-MODE_FILE = os.path.join(STATE_DIR, "mode")
-ARM_FILE = os.path.join(STATE_DIR, "armed_until")
-WAKE_FILE = os.path.join(STATE_DIR, "wake")
-LEVEL_FILE = os.path.join(STATE_DIR, "level")
-MIC_FILE = os.path.join(STATE_DIR, "mic")
-TOOL_FILE = os.path.join(STATE_DIR, "tool")
-# Current exchange for the persistent Jarvis console. These files live in the
-# per-user runtime directory, are bounded, and are cleared on a new turn or
-# daemon stop. They are UI state, not audit/log storage.
-REQUEST_FILE = os.path.join(STATE_DIR, "request")
-RESPONSE_FILE = os.path.join(STATE_DIR, "response")
-UI_TEXT_LIMIT = 1200
-# Jarvis-owned voxtype config, materialized at startup: pins
-# engine/model/language/vocabulary for transcription without touching the
-# user's voxtype setup (their push-to-talk keeps its own model).
-JARVIS_VOX_CONFIG = os.path.join(STATE_DIR, "voxtype.toml")
-# Custom wake-word models live here, outside the venv: a venv rebuild must
-# never eat a trained/downloaded model. This is home to an "igris" model
-# once one exists (train or download igris_vN.N.onnx into this dir).
-CUSTOM_WAKE_DIR = os.path.join(JARVIS_DIR, "wake-models")
-# Last startup refusal, for the panel. Written when config validation fails
-# (bad wake word, bad agent, bad mode/stt) so the UI can say why the mic is
-# off; cleared once the listener actually starts. Bounded text, no secrets.
-STARTUP_ERROR_FILE = os.path.join(STATE_DIR, "startup_error")
 
 # Redacted audit log. Deliberately NOT the journal and NOT under
 # XDG_RUNTIME_DIR (tmpfs, cleared on reboot): it must survive to prove
@@ -334,17 +125,6 @@ def _audit_path():
     return os.path.join(base, "jarvis", "audit.log")
 
 AUDIT_FILE = _audit_path()
-
-# Explicit modes. Safe is the only one allowed for always-on listening.
-MODES = ("safe", "workspace", "privileged")
-
-# The agent CLI's working directory. Deliberately NOT $HOME as hygiene, so a
-# relative path lands in an empty private directory rather than among the
-# user's files -- but this is NOT a security boundary and is never claimed
-# as one. Confinement comes from tool denial (safe), the broker allowlist
-# (workspace), and the jarvis-agent-run mount container (privileged), all
-# enforced outside the agent. 0700 and under XDG_RUNTIME_DIR where available.
-AGENT_CWD = os.path.join(STATE_DIR, "agent-cwd")
 
 _running = True
 
@@ -400,237 +180,6 @@ def _rotate_audit():
         log(f"audit rotation failed ({exc})")
 
 
-def current_mode(cfg):
-    mode = cfg.get("mode", "safe")
-    return mode if mode in MODES else "safe"
-
-
-def workspace_timeout(cfg, mode="workspace"):
-    """Arm window for a mode. Privileged ("Full") keeps the short window;
-    workspace ("Basic") gets the longer one -- broker verbs only."""
-    key = "full_disarm_seconds" if mode == "privileged" else \
-        "auto_disarm_seconds"
-    try:
-        secs = float(cfg.get("workspace", {}).get(
-            key, DEFAULTS["workspace"][key]))
-    except (TypeError, ValueError):
-        return 300.0 if mode == "privileged" else 1800.0
-    return min(max(secs, 60.0), 3600.0)
-
-
-def read_arm_deadline(arm_file=ARM_FILE):
-    """The workspace/privileged window's end (epoch seconds), or None."""
-    try:
-        return float(safefile.read_text(arm_file, 64).strip())
-    except (OSError, ValueError):
-        return None
-
-
-def arm_active(mode, now=None, arm_file=ARM_FILE):
-    """Authoritative arm state. Safe is always-on by definition; every other
-    mode is armed only inside a live window published at startup. The panel
-    reflects this file -- it never defines it: flipping config behind a
-    running daemon cannot arm anything until the daemon itself restarts and
-    republishes the deadline."""
-    if mode == "safe":
-        return True
-    deadline = read_arm_deadline(arm_file)
-    if deadline is None:
-        return False
-    return (now if now is not None else time.time()) < deadline
-
-
-def check_mode_invariants(mode, agent):
-    """Enforcement, not prompt promises. Returns [error strings].
-
-    Fail-closed in every mode: the daemon's own agent CLI must be positively
-    verified tool-free (TOOLS_DENIED), never merely "not known to grant".
-    Unknown posture is FAIL, not safe, everywhere -- there are no blessed
-    exceptions.
-    """
-    errors = []
-    if mode not in MODES:
-        return [f"unknown mode '{mode}'; want one of {', '.join(MODES)}"]
-    posture = tool_posture(agent.executable, agent.command)
-    if posture == TOOLS_UNKNOWN:
-        errors.append(
-            f"refuses agent '{agent.name}': tools not verified "
-            f"(unknown CLI posture is FAIL in {mode} mode, not safe)")
-    if posture == TOOLS_GRANTED:
-        errors.append(
-            f"refuses agent '{agent.name}': CLI tools granted")
-    if mode == "safe":
-        # Always-on mic: no broker actions at all, no web-exfil channel.
-        if agent.actions:
-            errors.append(
-                f"safe mode refuses actions=true on '{agent.name}': "
-                "workspace mode or later only")
-        if agent.web and any("WebFetch" in p or "Bash" in p
-                             or "--dangerously" in p
-                             for p in agent.web_command or []):
-            errors.append("safe mode refuses a web_command with "
-                          "WebFetch/Bash")
-    elif mode == "workspace":
-        # Broker verbs only, still never a CLI tool grant.
-        if grants_tools(agent.command):
-            errors.append(
-                f"workspace mode refuses agent '{agent.name}': CLI tool "
-                "flags in `command` (broker verbs only, no Bash)")
-    elif mode == "privileged":
-        # Full-tools only ever behind the jarvis-agent-run sandbox wrapper;
-        # voice never authorizes destructive ops (button/keyboard only).
-        # The daemon cannot verify the wrapper from argv alone, so this mode
-        # always logs loudly and requires the sandbox to exist.
-        if jarvis_agent_run_path() is None:
-            errors.append("privileged mode needs the jarvis-agent-run "
-                          "sandbox wrapper installed")
-    return errors
-
-
-def jarvis_agent_run_path():
-    here = os.path.dirname(os.path.abspath(__file__))
-    for candidate in (os.path.join(JARVIS_BIN, "jarvis-agent-run"),
-                      os.path.join(here, "jarvis-agent-run")):
-        if os.access(candidate, os.X_OK):
-            return candidate
-    return None
-
-
-# --------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------
-
-def merge(base, override):
-    """Recursive dict merge; override wins. Used to layer config over DEFAULTS."""
-    out = dict(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
-class Agent:
-    """One configured agent CLI: how to invoke it and what it's allowed to do."""
-
-    def __init__(self, name, spec):
-        command = spec.get("command")
-        if not isinstance(command, list) or not command:
-            raise ValueError(f"agent '{name}': 'command' must be a non-empty array")
-        if not all(isinstance(part, str) for part in command):
-            raise ValueError(f"agent '{name}': every 'command' entry must be a string")
-
-        self.name = name
-        self.command = command
-        self.actions = bool(spec.get("actions", False))
-
-        # A TOML string here would iterate as characters, and an empty prefix
-        # matches every line -- either way clean_reply would quietly eat the
-        # whole reply. A non-string would TypeError mid-exchange instead of
-        # at startup. Refuse all of it here, loudly.
-        prefixes = spec.get("strip_prefixes", [])
-        if isinstance(prefixes, str) or not isinstance(prefixes, list) \
-                or not all(isinstance(p, str) and p for p in prefixes):
-            raise ValueError(f"agent '{name}': 'strip_prefixes' must be an "
-                             "array of non-empty strings")
-        self.strip_prefixes = tuple(prefixes)
-
-        try:
-            self.timeout = float(spec.get("timeout", 180))
-        except (TypeError, ValueError):
-            raise ValueError(f"agent '{name}': 'timeout' must be a number")
-        if not 0 < self.timeout <= 3600:
-            raise ValueError(f"agent '{name}': 'timeout' must be between "
-                             "0 and 3600 seconds")
-
-        # A second argv for the web-enabled round of a search exchange --
-        # the one place a (CLI-enforced, read-only) search tool grant
-        # belongs. Its presence is what enables search for this agent.
-        web_command = spec.get("web_command")
-        if web_command is not None:
-            if not isinstance(web_command, list) or not web_command \
-                    or not all(isinstance(p, str) for p in web_command):
-                raise ValueError(f"agent '{name}': 'web_command' must be a "
-                                 "non-empty array of strings")
-        self.web_command = web_command
-        self.web = web_command is not None
-        self.web_uses_outfile = any("{outfile}" in part
-                                    for part in web_command or [])
-        # A {outfile} anywhere in argv means the reply is written to a file
-        # rather than printed -- the escape hatch for CLIs whose stdout is a
-        # progress log.
-        self.uses_outfile = any("{outfile}" in part for part in command)
-
-    @property
-    def system_prompt(self):
-        parts = [STYLE_PROMPT]
-        if not grants_tools(self.command):
-            parts.append(NO_TOOLS_PROMPT)
-        if self.actions:
-            parts.append(ACTIONS_PROMPT)
-        if self.web:
-            parts.append(WEB_PROMPT)
-        return "\n\n".join(parts)
-
-    @property
-    def executable(self):
-        return self.command[0]
-
-    def build_invocation(self, prompt, outfile, system_extra="", web=False):
-        """(argv, stdin_payload) for one question.
-
-        The transcript only lands in argv if the command template asks for it
-        with {prompt} -- argv is readable by every process on the machine, so
-        the presets don't. Without {prompt}, the transcript is fed on stdin;
-        a template that names neither {prompt} nor {system} gets both there,
-        system prompt first, for CLIs with no system-prompt flag.
-
-        web=True builds the search-capable second call: web_command's argv,
-        and a system prompt that offers no directives of any kind.
-        """
-        if web:
-            command = self.web_command
-            system = STYLE_PROMPT + "\n\n" + WEB_TURN_PROMPT
-        else:
-            command = self.command
-            system = self.system_prompt
-        if system_extra:
-            system += "\n\n" + system_extra
-        fields = {
-            "{prompt}": prompt,
-            "{system}": system,
-            "{outfile}": outfile or "",
-        }
-        used = set()
-        argv = []
-        for part in command:
-            for token, value in fields.items():
-                if token in part:
-                    used.add(token)
-                    part = part.replace(token, value)
-            argv.append(part)
-        if "{prompt}" in used:
-            return argv, None
-        if "{system}" in used:
-            return argv, prompt
-        return argv, system + "\n\n" + prompt
-
-
-def agent_cwd():
-    """An empty private directory to run the agent CLI in, falling back to /.
-
-    Never $HOME. If the directory cannot be made, / is still a better cwd than
-    the user's files, and the call proceeds rather than failing the reply.
-    """
-    try:
-        os.makedirs(AGENT_CWD, mode=0o700, exist_ok=True)
-        return AGENT_CWD
-    except OSError as exc:
-        log(f"could not create {AGENT_CWD} ({exc}); running the agent in /")
-        return "/"
-
-
 def load_config(path=CONFIG_PATH):
     """DEFAULTS, with ~/.config/jarvis/config.toml layered on top if present."""
     cfg = DEFAULTS
@@ -650,325 +199,6 @@ def load_config(path=CONFIG_PATH):
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         log(f"config unreadable ({exc}), using defaults")
     return cfg
-
-
-def grants_tools(argv):
-    """True if this argv hands the agent CLI tools of its own.
-
-    `--tools ""` is how the shipped invocation *removes* the built-in set, so
-    a --tools whose value is empty is a denial, not a grant; anything else
-    after it names tools to keep. --allowedTools adds to whatever is already
-    there, so it is always a grant.
-    """
-    for i, part in enumerate(argv):
-        if "--dangerously" in part or "--allowedTools" in part \
-                or "--allowed-tools" in part:
-            return True
-        if part == "--tools":
-            return bool(argv[i + 1].strip()) if i + 1 < len(argv) else False
-        if part.startswith("--tools="):
-            return bool(part.split("=", 1)[1].strip())
-    return False
-
-
-# Agent CLIs whose flag vocabulary this daemon actually knows. Recognising a
-# *denial* is not the same problem as recognising a grant: to say an
-# invocation is tool-free we have to know which flag removes the tools and
-# what its absence implies, and that is per-CLI knowledge. We have it for
-# Claude Code (argv flags) and for opencode (agent-file frontmatter, below).
-KNOWN_CLIS = ("claude", "opencode", "grok")
-
-TOOLS_DENIED = "denied"      # verified tool-free
-TOOLS_GRANTED = "granted"    # verified to hand the CLI tools
-TOOLS_UNKNOWN = "unknown"    # we cannot tell, so we must not claim
-
-
-# opencode 1.18.30 carries no permission keys on `run --help`: grants live in
-# the agent file frontmatter (~/.config/opencode/agents/<name>.md), where a
-# missing key falls back to the default-allow ruleset. So "denied" here means
-# every one of these keys is EXPLICITLY deny in that file -- anything else
-# (absent, ask, allow, unparseable) fails closed to unknown. Verified against
-# 1.18.30 via `opencode debug agent <name>` (effective tools map) plus the
-# disposable-dir read canary; re-verify after any opencode upgrade.
-OPENCODE_DENY_KEYS = (
-    "bash", "edit", "read", "glob", "grep", "list", "task",
-    "webfetch", "websearch", "skill", "lsp", "todowrite",
-    "external_directory", "question",
-)
-
-
-def opencode_agent_name(argv):
-    """The --agent value in an `opencode run` argv, or None."""
-    for i, part in enumerate(argv):
-        if part == "--agent" and i + 1 < len(argv):
-            return argv[i + 1].strip() or None
-        if part.startswith("--agent="):
-            return part.split("=", 1)[1].strip() or None
-    return None
-
-
-def opencode_frontmatter_denies(name):
-    """True only if the opencode agent file explicitly denies every tool key.
-
-    Reads descriptor-first (no symlink, regular file, our uid, bounded) --
-    the file decides what the always-on mic may invoke, so a planted symlink
-    or FIFO there must fail closed, not redirect or block us.
-    """
-    home = os.path.expanduser("~")
-    candidates = [
-        os.path.join(home, ".config", "opencode", "agents", name + ".md"),
-        os.path.join(home, ".config", "opencode", "agent", name + ".md"),
-    ]
-    text = None
-    for path in candidates:
-        try:
-            text = safefile.read_text(path, safefile.MAX_TEXT_BYTES)
-            break
-        except OSError:
-            continue
-    if text is None:
-        return False
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return False
-    front = []
-    for line in lines[1:]:
-        if line.strip() == "---":
-            break
-        front.append(line)
-    else:
-        return False  # no closing fence: not a frontmatter we understand
-    # Minimal parse of the `permission:` block: flat `key: action` pairs.
-    # Anything shaped differently (nested objects, anchors, missing block)
-    # fails closed -- we only recognise the exact all-deny shape we ship.
-    in_perm, seen = False, {}
-    for line in front:
-        if re.match(r"^permission\s*:\s*$", line):
-            in_perm = True
-            continue
-        if in_perm:
-            if re.match(r"^\S", line):
-                break  # next top-level key: permission block is over
-            match = re.match(r"^\s+([A-Za-z_*]+)\s*:\s*(.+?)\s*$", line)
-            if match:
-                seen[match.group(1)] = match.group(2).strip("\"'")
-    if not seen:
-        return False
-    if seen.get("*", "deny") != "deny":
-        return False
-    return all(seen.get(key) == "deny" for key in OPENCODE_DENY_KEYS)
-
-
-def tool_posture(executable, argv):
-    """What we can honestly say about the tools this invocation exposes.
-
-    The trap this exists to close: `actions` says whether *Jarvis* will act on
-    a <<jarvis:...>> directive. It says nothing about whether the agent CLI
-    has tools of its own. Reporting "answer-only" off `actions` alone once let
-    a `codex exec -s read-only` preset -- a live shell over $HOME -- describe
-    itself as answer-only in the panel, the journal and --check. An unknown
-    CLI is not a safe CLI, it is an unaudited one, and the label has to say so.
-    """
-    if grants_tools(argv):
-        return TOOLS_GRANTED
-    if os.path.basename(executable) not in KNOWN_CLIS:
-        return TOOLS_UNKNOWN
-    if os.path.basename(executable) == "opencode":
-        # No argv flag can deny opencode tools; the agent file is the whole
-        # story. All-deny frontmatter verifies tool-free, anything else --
-        # including an unreadable or hand-edited file -- fails closed.
-        name = opencode_agent_name(argv)
-        if name and opencode_frontmatter_denies(name):
-            return TOOLS_DENIED
-        return TOOLS_UNKNOWN
-    if os.path.basename(executable) == "grok":
-        # Grok Build: --tools "" is unset (all tools stay). Answer-only
-        # requires --disallowed-tools to name every filesystem/shell/web
-        # tool. Verified against grok 1.0.30 with a disposable-file canary.
-        return TOOLS_DENIED if grok_tools_denied(argv) else TOOLS_UNKNOWN
-    # Claude Code: tool-free requires *both* the empty built-in allowlist and
-    # a strict MCP config with nothing to load, or the user's own MCP servers
-    # come back. Bare `claude -p` is not answer-only.
-    empty_tools = any(
-        (part == "--tools" and i + 1 < len(argv) and not argv[i + 1].strip())
-        or (part.startswith("--tools=") and not part.split("=", 1)[1].strip())
-        for i, part in enumerate(argv)
-    )
-    strict_mcp = "--strict-mcp-config" in argv and not any(
-        part == "--mcp-config" or part.startswith("--mcp-config=")
-        for part in argv
-    )
-    return TOOLS_DENIED if (empty_tools and strict_mcp) else TOOLS_UNKNOWN
-
-
-def grok_tools_denied(argv):
-    """True only if argv names every required Grok tool in --disallowed-tools."""
-    denied = set()
-    for i, part in enumerate(argv):
-        raw = ""
-        if part == "--disallowed-tools" and i + 1 < len(argv):
-            raw = argv[i + 1]
-        elif part.startswith("--disallowed-tools="):
-            raw = part.split("=", 1)[1]
-        else:
-            continue
-        denied.update(t.strip() for t in raw.split(",") if t.strip())
-    required = set(GROK_DISALLOWED_TOOLS) - {"run_terminal_command"}
-    return required <= denied
-
-
-def capability_label(agent):
-    """One phrase for the panel, the journal and --check, and never a lie.
-
-    Unknown CLI posture is FAIL, never safe: anything we cannot positively
-    verify tool-free says so out loud.
-    """
-    posture = tool_posture(agent.executable, agent.command)
-    if posture == TOOLS_GRANTED:
-        return "FAIL: CLI tools granted"
-    if posture == TOOLS_UNKNOWN:
-        return "FAIL: tools not verified"
-    return "can act" if agent.actions else "answer-only"
-
-
-def _model_listed(model_id, timeout=15):
-    """Best-effort membership probe against `opencode models`.
-
-    Returns None when opencode could not be asked at all (missing, slow,
-    failing) -- startup must never depend on a probe -- else whether
-    model_id is listed.
-    """
-    try:
-        import subprocess
-        proc = subprocess.run(["opencode", "models"], capture_output=True,
-                              text=True, timeout=timeout)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return None
-    if proc.returncode != 0:
-        return None
-    return any(line.strip() == model_id for line in proc.stdout.splitlines())
-
-
-def inject_model_flag(template, model_setting, after_flag=None):
-    """Insert or replace -m/--model in an argv template (mutates in place)."""
-    for flag in ("-m", "--model"):
-        if flag in template:
-            idx = template.index(flag)
-            if idx + 1 < len(template):
-                template[idx + 1] = model_setting
-            else:
-                template.append(model_setting)
-            return
-    if after_flag and after_flag in template:
-        idx = template.index(after_flag)
-        template.insert(idx + 2, "-m")
-        template.insert(idx + 3, model_setting)
-        return
-    template.insert(1, "-m")
-    template.insert(2, model_setting)
-
-
-def select_agent(cfg):
-    """Resolve cfg['agent'] to an Agent, failing loudly on a bad name."""
-    name = cfg.get("agent", "claude")
-    specs = cfg.get("agents", {})
-    if name not in specs:
-        known = ", ".join(sorted(specs)) or "none"
-        raise SystemExit(f"[jarvis] unknown agent '{name}'. Configured: {known}")
-    try:
-        agent = Agent(name, specs[name])
-    except ValueError as exc:
-        # A clean message, not a traceback, for systemd's restart loop to log.
-        raise SystemExit(f"[jarvis] {exc}")
-    # The top-level `model` key is injected as `-m` for agents that take it
-    # (opencode-voice, grok). The panel Model dropdown writes that key.
-    if name in ("opencode-voice", "grok"):
-        model_setting = cfg.get("model")
-        if name == "grok" and (
-                not model_setting or not str(model_setting).startswith("grok-")):
-            model_setting = GROK_DEFAULT_MODEL
-        if not model_setting:
-            log(f"warning: no model configured for {name}; pick one in the panel")
-        else:
-            after = "--agent" if name == "opencode-voice" else None
-            for label, template in (("command", agent.command),
-                                    ("web_command", agent.web_command or [])):
-                if not template:
-                    continue
-                if after and after not in template:
-                    log(f"warning: agent '{name}' {label} has no '{after}'; "
-                        "cannot inject the configured model there")
-                    continue
-                inject_model_flag(template, model_setting, after_flag=after)
-            if name == "opencode-voice" and _model_listed(model_setting) is False:
-                log(f"warning: configured model '{model_setting}' is not "
-                    "listed by `opencode models`; continuing anyway")
-    if shutil.which(agent.executable) is None:
-        log(f"warning: '{agent.executable}' is not on PATH -- replies will fail")
-    # Both argv templates, not just the first: web_command carries a search
-    # query derived from the same transcript, and argv is argv.
-    for label, template in (("command", agent.command),
-                            ("web_command", agent.web_command or [])):
-        if any("{prompt}" in part for part in template):
-            log(f"warning: agent '{agent.name}' puts the transcript in argv "
-                f"via `{label}`, where every local process can read it; drop "
-                f"{{prompt}} from `{label}` to send it on stdin instead")
-    # Actions are brokered by this daemon, never by a tool grant to the CLI.
-    # A command that hands the agent tools anyway isn't something we can
-    # police -- it's the user's argv -- but it deserves a loud note. An
-    # *empty* --tools is the opposite of a grant, so it doesn't count.
-    if grants_tools(agent.command):
-        log(f"warning: agent '{agent.name}' grants the CLI tools in `command`. "
-            "Jarvis never needs that: actions go through the jarvis-open "
-            "broker, and a search grant belongs in `web_command`. Remove the "
-            "tool flags unless you accept the risk.")
-    elif tool_posture(agent.executable, agent.command) == TOOLS_UNKNOWN:
-        # Not an accusation, an admission: we do not know this CLI's flags, so
-        # we cannot tell a text box from a shell. Saying nothing here is what
-        # let a read-only Codex sandbox pass itself off as answer-only.
-        log(f"warning: agent '{agent.name}' runs '{agent.executable}', whose "
-            "tool flags Jarvis does not know, so it CANNOT confirm this "
-            "invocation is answer-only. A sandbox flag is not a tool denial: "
-            "some CLIs still read every file you can. Verify it yourself -- "
-            "put a known string in a file, then run `jarvis-listen --ask "
-            "\"read <that file> and tell me what it says\"`. If the string "
-            "comes back, this agent can read your home directory.")
-    # The web invocation reads the open internet, so what it may hold matters
-    # more, not less: WebFetch or a shell there hands a hostile page an
-    # exfiltration channel. WebSearch alone is the sanctioned grant.
-    if any("WebFetch" in part or "Bash" in part or "--dangerously" in part
-           for part in agent.web_command or []):
-        log(f"warning: agent '{agent.name}' grants `web_command` more than "
-            "web search. A fetch tool or a shell in the web-enabled call "
-            "lets a hostile page exfiltrate or act; grant WebSearch only.")
-    caps = capability_label(agent)
-    if agent.web:
-        caps += ", web search"
-    mode = current_mode(cfg)
-    log(f"agent: {agent.name} ({caps})")
-    log(f"mode: {mode}")
-    for problem in check_mode_invariants(mode, agent):
-        log(f"REFUSING startup: {problem}")
-        raise SystemExit(f"[jarvis] {problem}")
-    if mode != "safe":
-        log(f"workspace auto-disarm: {workspace_timeout(cfg, mode):.0f}s "
-            "(explicit physical action only; voice authorizes nothing "
-            "destructive)")
-    # Publish mode for the widget/panel alongside the pipeline state.
-    try:
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        safefile.write_atomic(MODE_FILE, mode)
-        if mode == "safe":
-            try:
-                os.unlink(ARM_FILE)
-            except OSError:
-                pass
-        else:
-            deadline = time.time() + workspace_timeout(cfg, mode)
-            safefile.write_atomic(ARM_FILE, f"{deadline:.0f}")
-    except OSError:
-        pass
-    return agent
 
 
 def resolve_voice(cfg):
@@ -1006,22 +236,6 @@ def wake_models():
     return found
 
 
-def note_startup_error(msg):
-    """Record why the listener refused to start (panel reads this)."""
-    try:
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        safefile.write_atomic(STARTUP_ERROR_FILE, str(msg)[:500])
-    except OSError:
-        pass
-
-
-def clear_startup_error():
-    try:
-        os.unlink(STARTUP_ERROR_FILE)
-    except OSError:
-        pass
-
-
 def resolve_wake_model(cfg):
     """Map a wake-word name to an installed onnx file.
 
@@ -1044,119 +258,9 @@ def resolve_wake_model(cfg):
                      + hint)
 
 
-# --------------------------------------------------------------------------
-# Pipeline state, shared with the bar widget
-# --------------------------------------------------------------------------
-
-def set_state(state):
-    """Publish pipeline state for the bar widget (idle/listening/thinking/speaking).
-
-    safefile.write_atomic writes an unpredictably named 0600 temp file inside
-    the 0700 state dir and renames it over the target, so there is no
-    guessable `state.tmp` to pre-plant and the widget's once-a-second reader
-    only ever sees a complete value.
-    """
-    try:
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        safefile.write_atomic(STATE_FILE, state)
-    except OSError:
-        pass
-
-
-def publish_ui_text(path, text):
-    """Publish bounded current-turn text to the local runtime UI only."""
-    try:
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        safefile.write_atomic(path, str(text or "")[:UI_TEXT_LIMIT])
-    except OSError:
-        pass
-
-
-def clear_ui_text():
-    publish_ui_text(REQUEST_FILE, "")
-    publish_ui_text(RESPONSE_FILE, "")
-
-
 def on_signal(_signum, _frame):
     global _running
     _running = False
-
-
-# --------------------------------------------------------------------------
-# UI telemetry: numbers only, never audio, transcripts or arguments.
-#
-# The avatar/EQ widgets read these; every file holds bounded numeric tokens.
-# Transient by design: levels decay to 0, mic buckets go stale (>1.5s) the
-# moment listening ends, and nothing here is ever logged or persisted beyond
-# the runtime dir (tmpfs, per-user 0700).
-# --------------------------------------------------------------------------
-
-def _publish(path, text):
-    try:
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        safefile.write_atomic(path, text)
-    except OSError:
-        pass
-
-
-def note_wake():
-    """Mark a wake-word detection for the 2s avatar flash."""
-    _publish(WAKE_FILE, f"{time.time():.0f}")
-
-
-def set_level(value):
-    """Playback amplitude 0-100 + epoch for the speaking avatar. Only ever
-    written while Piper audio is actually playing; otherwise 0 (never faked).
-    The epoch lets the widget ignore a stale file from a crashed run."""
-    _publish(LEVEL_FILE,
-             f"{max(0, min(100, int(value)))} {time.time():.0f}")
-
-
-def publish_tool(category):
-    """Last tool-activity category + epoch (e.g. "broker:volume"). Category
-    only -- never arguments, outputs or transcripts."""
-    _publish(TOOL_FILE, f"{category[:32]} {time.time():.0f}")
-
-
-MIC_BUCKETS = 12
-
-
-def rms_to_100(value, gate):
-    """Gate + scale a raw RMS value to a 0-100 EQ bucket. Below the noise
-    gate: 0, so idle room noise never jitters the visualization."""
-    if value <= gate:
-        return 0
-    return max(0, min(100, int((value - gate) / max(gate, 1.0) * 60)))
-
-
-def publish_mic(history):
-    """12 gated amplitude buckets + epoch. Raw mic audio is never stored --
-    only these transient buckets, which the widget dims once stale."""
-    buckets = ([0] * MIC_BUCKETS + list(history))[-MIC_BUCKETS:]
-    _publish(MIC_FILE, " ".join(str(max(0, min(100, int(v)))) for v in buckets)
-             + f" {time.time():.0f}")
-
-
-def _wav_envelope(path, bucket_ms=100):
-    """Per-bucket RMS 0-100 of a 16-bit mono wav, for amplitude-synced
-    speaking animation. Pure function of the file bytes (unit-tested)."""
-    import wave
-    try:
-        with wave.open(path, "rb") as fh:
-            rate = fh.getframerate() or 22050
-            frames = fh.readframes(fh.getnframes())
-    except (OSError, wave.Error):
-        return []
-    if not frames:
-        return []
-    samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
-    per = max(1, int(rate * bucket_ms / 1000))
-    peak = float(np.max(np.abs(samples))) or 1.0
-    out = []
-    for i in range(0, len(samples), per):
-        chunk = samples[i:i + per]
-        out.append(int(float(np.sqrt(np.mean(chunk ** 2))) / peak * 100))
-    return out
 
 
 # --------------------------------------------------------------------------
@@ -1542,10 +646,20 @@ def resolve_stt(cfg):
 
     A misspelled engine or model must refuse startup with a clear message,
     not silently transcribe with whatever voxtype happens to default to.
+    Parakeet is experimental until voxtype's ONNX path is verified here:
+    set JARVIS_EXPERIMENTAL_STT=1 to opt in.
     """
     stt = merge(DEFAULTS["stt"], cfg.get("stt", {}))
     engine = stt.get("engine", "whisper")
-    if engine not in STT_ENGINES:
+    experimental = os.environ.get("JARVIS_EXPERIMENTAL_STT", "").strip() == "1"
+    allowed_engines = STT_ENGINES + (STT_ENGINES_EXPERIMENTAL
+                                     if experimental else ())
+    if engine not in allowed_engines:
+        if engine in STT_ENGINES_EXPERIMENTAL:
+            raise SystemExit(
+                f"[jarvis] stt engine {engine!r} is experimental and not "
+                "verified on this voxtype build. Use engine = \"whisper\", "
+                "or set JARVIS_EXPERIMENTAL_STT=1 to opt in.")
         raise SystemExit(f"[jarvis] unknown stt engine {engine!r}. "
                          f"Available: {', '.join(STT_ENGINES)}")
     model = stt.get("model", "")
@@ -1765,10 +879,6 @@ BRIGHTNESS_RE = re.compile(r"^(\d{1,3}|up|down)$")
 WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,31}$")
 MUTE_RE = re.compile(r"^(on|off|toggle|mute|unmute)$")
 MEDIA_RE = re.compile(r"^(play|pause|toggle|next|prev|stop|quit)$")
-# Song/artist words for the music verb: letters, digits, spaces and a small
-# set of title punctuation. The broker resolves these to one top YouTube
-# result itself -- the agent never sees URLs and never picks one.
-MUSIC_QUERY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 +.'\-]{0,79}$")
 # Account collections: favourites/watch-later open your liked/WL pages (your
 # login comes from the default browser, never from credentials here); named
 # playlists resolve through the [music.playlists] map in config.toml, so no
@@ -2220,188 +1330,6 @@ def _play_with_levels(path, timeout=300):
             proc.kill()
             proc.wait()
         set_level(0)
-
-
-# Canned confirmations for the routine fast path (generic wording only --
-# song names and other speech never go back out verbatim from here).
-ROUTINE_CONFIRM = {
-    "app": "Opening it now.", "url": "Opening it now.",
-    "volume": "Volume adjusted.", "brightness": "Brightness adjusted.",
-    "workspace": "Switching workspace.", "mute": "Done.",
-    "media": "Done.", "music": "Playing it now.",
-    "mymusic": "Playing it now.", "focus-window": "Focusing it now.",
-    "move-window": "Moving it now.", "fullscreen": "Toggling fullscreen.",
-    "lock": "Locking the screen.", "screenshot": "Screenshot saved.",
-    "notify": "Noted.",
-}
-# Spoken when a needs_confirm verb stages on-screen approval (nothing ran).
-PENDING_CONFIRM = ("That one needs a tap to confirm -- "
-                   "check the card for Confirm or Deny.")
-
-
-def _command_words(text):
-    """Lowercased, whitespace-collapsed, minus leading/trailing politeness."""
-    t = " ".join(text.strip().lower().split())
-    t = re.sub(r"^(please|hey|hi|ok|so)[, ]+", "", t)
-    t = re.sub(r"[, ]+(please|thanks|thank you)$", "", t)
-    return t
-
-
-def match_routine_intent(text):
-    """(kind, value) for routine commands, else None.
-
-    Deliberately verb-first and conservative: questions ("can you play
-    something?"), chatter and bare ambiguous words ("stop") never match and
-    fall through to the model. Everything returned still passes through
-    run_directive's mode/arm/allowlist enforcement -- this skips the LLM
-    round-trip, never a check.
-    """
-    t = _command_words(text)
-    if not t:
-        return None
-    m = re.match(r"^play my\s+(liked(\s+(songs?|music|playlist))?|"
-                 r"favourites?|favorites?)\s*$", t)
-    if m:
-        return ("mymusic", "liked")
-    if re.match(r"^play my\s+watch\s?later\s*$", t):
-        return ("mymusic", "watchlater")
-    m = re.match(r"^play (?:my )?playlist\s+([a-z0-9 _.'\-]{1,40})$", t)
-    if m:
-        return ("mymusic", f"playlist {m.group(1).strip()}")
-    # "player X" is a common STT of "play a/the X".
-    m = re.match(r"^(?:play|put on|player)\s+(.{1,80})$", t)
-    if m:
-        query = " ".join(m.group(1).split())
-        if MUSIC_QUERY_RE.match(query):
-            return ("music", query)
-        return None
-    media = [
-        (r"^pause(?: (?:the )?(?:music|song|video|playback))?$", "pause"),
-        (r"^(?:resume|unpause)(?: (?:the )?(?:music|song|video|playback))?$",
-         "play"),
-        (r"^(?:next|skip)(?: (?:the )?(?:music|song|video|track))?$", "next"),
-        (r"^(?:previous|last|back)(?: (?:the )?(?:music|song|video|track))?$",
-         "prev"),
-        (r"^stop the (?:music|song|video|playback)$", "stop"),
-        (r"^quit the (?:music|player|song)$", "quit"),
-        (r"^close the (?:music|player)$", "quit"),
-    ]
-    for pattern, value in media:
-        if re.match(pattern, t):
-            return ("media", value)
-    volume = [
-        (r"^(?:volume )?(up|louder)$", "up"),
-        (r"^(?:volume )?(down|quieter|softer)$", "down"),
-        (r"^(?:volume )?(mute|silence)(?: the (?:music|sound|volume|it))?$",
-         "mute"),
-        (r"^unmute(?: the (?:music|sound|volume|it))?$", "unmute"),
-        (r"^turn (?:it |the volume |the music |the sound )?(up|down)$", None),
-        (r"^volume (\d{1,3})$", None),
-        (r"^(?:max|maximum|full) volume$", "100"),
-    ]
-    for pattern, value in volume:
-        m = re.match(pattern, t)
-        if m:
-            if value is not None:
-                return ("volume", value)
-            word = m.group(1)
-            if word in ("up", "down"):
-                return ("volume", word)
-            if word.isdigit() and 0 <= int(word) <= 100:
-                return ("volume", str(int(word)))
-            return None
-    if t == "open youtube":
-        return ("url", "https://www.youtube.com/")
-    # Workspaces before generic "open APP": "open workspace 5" is not an app.
-    # Names here are a single token (no spaces) so "go to workspace 5 and
-    # open chromium" cannot be swallowed as a workspace named
-    # "5 and open chromium" -- Hyprland then errors Bad workspace.
-    _ws = r"([a-z0-9][a-z0-9_.-]{0,31})"
-    m = re.match(rf"^(?:switch to|go to|move to|open|show) workspace {_ws}$",
-                 t)
-    if m:
-        return ("workspace", m.group(1).strip())
-    m = re.match(rf"^workspace {_ws}$", t)
-    if m:
-        return ("workspace", m.group(1).strip())
-    m = re.match(r"^(?:open|launch|start|run)(?: the)? "
-                 r"([a-z0-9][a-z0-9 ._\-]{0,30})$", t)
-    if m and not m.group(1).startswith("workspace"):
-        return ("app", m.group(1).strip())
-    if re.match(r"^(?:go to |switch to |move to )?(?:the )?"
-                r"(next|previous) workspace$", t):
-        which = "next" if "next" in t.split() else "previous"
-        return ("workspace", which)
-    # Focus / move windows. Focus refuses bare "workspace ..." so the two
-    # never collide; move needs an explicit workspace target.
-    m = re.match(r"^(?:focus|switch to|bring to front|show) "
-                 r"([a-z0-9][a-z0-9 ._\-+]{0,40})$", t)
-    if m and not m.group(1).startswith("workspace"):
-        return ("focus-window", m.group(1).strip())
-    m = re.match(r"^move (?:the |this |current )?(.+?) to workspace "
-                 r"([a-z0-9][a-z0-9 _.\-]{0,31}|next|previous)$", t)
-    if m:
-        query = " ".join(m.group(1).split())
-        if query in ("window", "this window", "current window", "it"):
-            query = "this"
-        if actions.FOCUS_QUERY_RE.match(query):
-            return ("move-window", [query, m.group(2).strip()])
-        return None
-    if re.match(r"^(?:toggle |make (?:it|this) )?fullscreen$", t):
-        return ("fullscreen", "")
-    if re.match(r"^lock (?:the )?screen$", t):
-        return ("lock", "")
-    if re.match(r"^take a screenshot$", t) or t == "screenshot":
-        return ("screenshot", "full")
-    if re.match(r"^screenshot (?:this|the|current) window$", t):
-        return ("screenshot", "window")
-    m = re.match(r"^remind me to ([a-z0-9][a-z0-9 .,!?\'\"()\-]{0,120})$",
-                 t)
-    if m:
-        text = " ".join(m.group(1).split())
-        if actions.NOTIFY_RE.match(text):
-            return ("notify", text)
-        return None
-    # Close: the focused window only. (Music-player closes stay media quit.)
-    if re.match(r"^close (?:this|the current|the) window$", t):
-        return ("close-window", "")
-    m = re.match(r"^(?:log|sign) (?:me )?out$", t)
-    if m:
-        return ("logout", "")
-    if re.match(r"^reboot(?: the (?:machine|computer|system))?$", t):
-        return ("reboot", "")
-    if re.match(r"^(?:power off|shut down|shutdown)"
-                r"(?: the (?:machine|computer|system))?$", t):
-        return ("poweroff", "")
-    m = re.match(r"^(?:turn )?wi-?fi (on|off)$", t)
-    if m:
-        return ("wifi", m.group(1))
-    return None
-
-
-def match_routine_intents(text):
-    """One or more routine intents when the utterance is only those commands.
-
-    Compound speech ("go to workspace 5 and open chromium") is split on
-    and/then. Every clause must match or this returns None and the model
-    handles the whole sentence. A single-clause match still wins first.
-    """
-    t = _command_words(text)
-    if not t:
-        return None
-    one = match_routine_intent(t)
-    if one is not None:
-        return [one]
-    parts = re.split(r"\s+(?:and then|then|and)\s+", t)
-    if len(parts) < 2 or len(parts) > 4:
-        return None
-    intents = []
-    for part in parts:
-        got = match_routine_intent(part)
-        if got is None:
-            return None
-        intents.append(got)
-    return intents
 
 
 def respond(agent, voice, text, log_text=False, mode="safe",

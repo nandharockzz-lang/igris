@@ -71,20 +71,25 @@ fi
 
 # --- daemon ----------------------------------------------------------------
 say "Installing the daemon"
-mkdir -p "$JARVIS_DIR/bin" "$JARVIS_DIR/voices"
+mkdir -p "$JARVIS_DIR/bin" "$JARVIS_DIR/lib" "$JARVIS_DIR/voices"
 put 755 "$SRC/daemon/jarvis-listen.py" "$JARVIS_DIR/jarvis-listen.py"
 put 755 "$SRC/daemon/jarvis-open"      "$JARVIS_DIR/bin/jarvis-open"
 put 755 "$SRC/daemon/jarvis-config"    "$JARVIS_DIR/jarvis-config"
 put 755 "$SRC/daemon/jarvis-agent-run" "$JARVIS_DIR/bin/jarvis-agent-run"
 put 755 "$SRC/daemon/jarvis-rollback"  "$JARVIS_DIR/bin/jarvis-rollback"
 put 755 "$SRC/daemon/jarvis-toggle"    "$JARVIS_DIR/bin/jarvis-toggle"
-# The safe-file helpers are imported by all three, and each imports it from
-# its own directory, so it lands in both. actions.py is the versioned
-# local-action contract (grammar + confirmation), shared the same way.
-put 644 "$SRC/daemon/safefile.py"      "$JARVIS_DIR/safefile.py"
-put 644 "$SRC/daemon/safefile.py"      "$JARVIS_DIR/bin/safefile.py"
-put 644 "$SRC/daemon/actions.py"       "$JARVIS_DIR/actions.py"
-put 644 "$SRC/daemon/actions.py"       "$JARVIS_DIR/bin/actions.py"
+# Shared Python modules live in lib/ once. Helpers add that path via
+# jarvis_libpath (repo flat layout still works: modules sit next to scripts).
+put 644 "$SRC/daemon/jarvis_libpath.py" "$JARVIS_DIR/lib/jarvis_libpath.py"
+put 644 "$SRC/daemon/jarvis_libpath.py" "$JARVIS_DIR/jarvis_libpath.py"
+put 644 "$SRC/daemon/safefile.py"       "$JARVIS_DIR/lib/safefile.py"
+put 644 "$SRC/daemon/actions.py"        "$JARVIS_DIR/lib/actions.py"
+put 644 "$SRC/daemon/agent_posture.py"  "$JARVIS_DIR/lib/agent_posture.py"
+put 644 "$SRC/daemon/ux_state.py"       "$JARVIS_DIR/lib/ux_state.py"
+put 644 "$SRC/daemon/routines.py"       "$JARVIS_DIR/lib/routines.py"
+# Drop stale dual copies from older installs if present.
+rm -f "$JARVIS_DIR/safefile.py" "$JARVIS_DIR/actions.py" \
+      "$JARVIS_DIR/bin/safefile.py" "$JARVIS_DIR/bin/actions.py"
 # Checksums for every voice the settings panel can download. Without it,
 # jarvis-config refuses to install a voice rather than installing an
 # unverified one.

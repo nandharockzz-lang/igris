@@ -411,8 +411,16 @@ class EqGateTests(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="jarvis-mic-")
         self.addCleanup(shutil.rmtree, tmp, True)
         real_mic, real_tool = jl.MIC_FILE, jl.TOOL_FILE
-        jl.MIC_FILE = os.path.join(tmp, "mic")
-        jl.TOOL_FILE = os.path.join(tmp, "tool")
+        real_ux_mic = jl.ux_state.MIC_FILE
+        real_ux_tool = jl.ux_state.TOOL_FILE
+        real_ux_state = jl.ux_state.STATE_DIR
+        mic_path = os.path.join(tmp, "mic")
+        tool_path = os.path.join(tmp, "tool")
+        jl.MIC_FILE = mic_path
+        jl.TOOL_FILE = tool_path
+        jl.ux_state.MIC_FILE = mic_path
+        jl.ux_state.TOOL_FILE = tool_path
+        jl.ux_state.STATE_DIR = tmp
         try:
             jl.publish_mic([10, 20, 30])
             jl.publish_tool("broker:volume")
@@ -424,6 +432,9 @@ class EqGateTests(unittest.TestCase):
             self.assertEqual(tool[0], "broker:volume")
         finally:
             jl.MIC_FILE, jl.TOOL_FILE = real_mic, real_tool
+            jl.ux_state.MIC_FILE = real_ux_mic
+            jl.ux_state.TOOL_FILE = real_ux_tool
+            jl.ux_state.STATE_DIR = real_ux_state
 
 
 class AuditCleanlinessTests(unittest.TestCase):
@@ -431,8 +442,12 @@ class AuditCleanlinessTests(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="jarvis-audit-")
         self.addCleanup(shutil.rmtree, tmp, True)
         real_file, real_tool = jl.AUDIT_FILE, jl.TOOL_FILE
+        real_ux_tool = jl.ux_state.TOOL_FILE
+        real_ux_state = jl.ux_state.STATE_DIR
         jl.AUDIT_FILE = os.path.join(tmp, "audit.log")
         jl.TOOL_FILE = os.path.join(tmp, "tool")
+        jl.ux_state.TOOL_FILE = jl.TOOL_FILE
+        jl.ux_state.STATE_DIR = tmp
         real_bounded = jl.run_bounded
         jl.run_bounded = lambda *a, **k: jl.BoundedRun(
             returncode=0, stdout="ok", stderr="", overflowed=False)
@@ -444,6 +459,8 @@ class AuditCleanlinessTests(unittest.TestCase):
         finally:
             jl.run_bounded = real_bounded
             jl.AUDIT_FILE, jl.TOOL_FILE = real_file, real_tool
+            jl.ux_state.TOOL_FILE = real_ux_tool
+            jl.ux_state.STATE_DIR = real_ux_state
         log = open(os.path.join(tmp, "audit.log")).read()
         self.assertNotIn("Secret", log)
         self.assertNotIn("secret", log)

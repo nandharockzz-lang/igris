@@ -19,8 +19,17 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-import safefile  # noqa: E402  (needs HERE on the path first)
+for _c in (HERE, os.path.join(HERE, "lib"),
+           os.path.join(os.path.dirname(HERE), "lib")):
+    _abs = os.path.abspath(_c)
+    if os.path.isfile(os.path.join(_abs, "safefile.py")):
+        if _abs not in sys.path:
+            sys.path.insert(0, _abs)
+        break
+else:
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+import safefile  # noqa: E402  (needs lib/ or HERE on the path first)
 
 CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
     os.path.expanduser("~"), ".config")
@@ -168,9 +177,18 @@ def validate(daemon, key, value, config_path):
         raise SystemExit(f"{key} must be positive")
     if key == "draggable_avatar_enabled" and not isinstance(value, bool):
         raise SystemExit("draggable_avatar_enabled must be true or false")
-    if key == "stt.engine" and value not in daemon.STT_ENGINES:
-        raise SystemExit(f"unknown stt engine {value!r}. "
-                         f"Available: {', '.join(daemon.STT_ENGINES)}")
+    if key == "stt.engine":
+        experimental = os.environ.get("JARVIS_EXPERIMENTAL_STT", "").strip() == "1"
+        allowed = daemon.STT_ENGINES + (
+            getattr(daemon, "STT_ENGINES_EXPERIMENTAL", ())
+            if experimental else ())
+        if value not in allowed:
+            if value in getattr(daemon, "STT_ENGINES_EXPERIMENTAL", ()):
+                raise SystemExit(
+                    f"stt engine {value!r} is experimental. Use whisper, "
+                    "or set JARVIS_EXPERIMENTAL_STT=1 to opt in.")
+            raise SystemExit(f"unknown stt engine {value!r}. "
+                             f"Available: {', '.join(daemon.STT_ENGINES)}")
     if key == "stt.model":
         cfg = daemon.load_config(config_path)
         engine = cfg.get("stt", {}).get("engine",
@@ -436,17 +454,15 @@ def cmd_show(daemon, args):
 
 
 def wake_word_list(daemon):
-    """Every wake model the panel may offer: installed ones plus known
-    names (today: igris) flagged not-installed, so the UI offers exactly
-    what would actually work."""
+    """Wake models the panel may offer: installed ones only.
+
+    Custom names like igris stay selectable once installed via
+    `jarvis-config install-wake-word`; until then they are omitted so the
+    UI cannot point at a dead end.
+    """
     installed = daemon.wake_models()
-    out = [{"name": name, "installed": True}
-           for name in sorted(installed)]
-    known = set(installed)
-    for name in daemon.WAKE_WORDS:
-        if name not in known:
-            out.append({"name": name, "installed": False})
-    return out
+    return [{"name": name, "installed": True}
+            for name in sorted(installed)]
 
 
 def startup_error_text(daemon):

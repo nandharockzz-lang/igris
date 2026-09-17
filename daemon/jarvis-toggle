@@ -10,12 +10,13 @@ UI mapping (internal daemon modes preserved):
            countdown; destructive ops still need keyboard/button approval
 
 The daemon owns the mode state. This script only REQUESTS transitions: it
-writes `mode` through `jarvis-config set` (which reuses daemon validation)
-and starts/stops/restarts the unit. If the daemon refuses (bad combination),
-the unit never becomes active and this reports the failure instead of
-pretending -- there is no path here that bypasses daemon checks. It never
-touches anything under [agents.*] (no argv, no actions flag); lighting up
-broker verbs remains a deliberate hand-edit (see the hint below).
+writes `mode` (and the top-level `actions` flag) through `jarvis-config set`
+(which reuses daemon validation) and starts/stops/restarts the unit. Basic
+and Full set `actions=true`; stopping sets `actions=false` so a later Safe
+arm can never refuse startup. It never touches anything under `[agents.*]`
+(no argv edits). If the daemon refuses (bad combination), the unit never
+becomes active and this reports the failure instead of pretending -- there
+is no path here that bypasses daemon checks.
 
 Usage:
     jarvis-toggle [--unit NAME] [--config PATH] [--state-dir DIR] [--status]
@@ -29,8 +30,19 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import safefile  # noqa: E402  (needs our own directory on the path first)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# Locate shared modules: repo flat layout, $JARVIS_DIR/lib, or sibling lib/.
+for _c in (_HERE, os.path.join(_HERE, "lib"),
+           os.path.join(os.path.dirname(_HERE), "lib")):
+    _abs = os.path.abspath(_c)
+    if os.path.isfile(os.path.join(_abs, "safefile.py")):
+        if _abs not in sys.path:
+            sys.path.insert(0, _abs)
+        break
+else:
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
+import safefile  # noqa: E402
 
 HOME = os.path.expanduser("~")
 CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")

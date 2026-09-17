@@ -283,17 +283,21 @@ class QmlStaticTests(unittest.TestCase):
         self.assertIn("Listener: ", panel)
 
     def test_card_surface_matches_card(self):
+        # Console surface lives in ConsoleCard.qml (hosted by DraggableAvatar);
+        # the service owns pending-confirm polling and answerPending.
+        card = self.read("ConsoleCard.qml")
+        self.assertIn("id: card", card)
+        avatar = self.read("DraggableAvatar.qml")
+        self.assertIn("ConsoleCard {", avatar)
         svc = self.read("service.qml")
-        self.assertIn("implicitWidth: card.width", svc)
-        self.assertIn("implicitHeight: card.height", svc)
-        self.assertIn("visible: card.visible", svc)
-        self.assertIn("Region { item: card }", svc)
-        self.assertNotIn("bottom: true; left: true", svc)
+        self.assertIn("pendingActive", svc)
+        self.assertIn("answerPending", svc)
 
     def test_avatar_falls_back_to_canvas(self):
         goku = self.read("GokuAvatar.qml")
         self.assertIn("ChibiAvatar {", goku)
-        self.assertIn("visible: status === Image.Ready", goku)
+        self.assertIn("visible: !root.spriteReady", goku)
+        self.assertIn("visible: root.spriteReady", goku)
 
 
 if __name__ == "__main__":

@@ -376,10 +376,9 @@ class QmlGateTests(unittest.TestCase):
     def test_card_has_confirm_deny(self):
         svc = self.read("service.qml")
         self.assertIn("pendingActive", svc)
-        self.assertIn("answerPending(true)", svc)
-        self.assertIn("answerPending(false)", svc)
-        self.assertIn('"confirm"', svc)
-        self.assertIn('"deny"', svc)
+        self.assertIn("function answerPending(confirmed)", svc)
+        self.assertIn('confirmed ? "confirm" : "deny"', svc)
+        self.assertIn("onPendingAnswered", svc)
 
 
 if __name__ == "__main__":

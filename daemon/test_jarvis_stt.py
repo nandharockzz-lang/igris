@@ -59,9 +59,16 @@ class ResolveTests(unittest.TestCase):
             jl.resolve_stt({"stt": {"engine": "whisper",
                                     "model": "huge.en"}})
 
-    def test_parakeet_model_names_accepted(self):
-        stt = jl.resolve_stt({"stt": {"engine": "parakeet",
-                                      "model": "parakeet-tdt-0.6b-v3-int8"}})
+    def test_parakeet_refused_without_experimental_flag(self):
+        with self.assertRaises(SystemExit) as ctx:
+            jl.resolve_stt({"stt": {"engine": "parakeet",
+                                    "model": "parakeet-tdt-0.6b-v3-int8"}})
+        self.assertIn("experimental", str(ctx.exception).lower())
+
+    def test_parakeet_accepted_with_experimental_flag(self):
+        with mock.patch.dict(os.environ, {"JARVIS_EXPERIMENTAL_STT": "1"}):
+            stt = jl.resolve_stt({"stt": {"engine": "parakeet",
+                                          "model": "parakeet-tdt-0.6b-v3-int8"}})
         self.assertEqual(stt["model"], "parakeet-tdt-0.6b-v3-int8")
 
     def test_empty_language_refused(self):

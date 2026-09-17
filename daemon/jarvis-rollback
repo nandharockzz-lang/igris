@@ -29,8 +29,19 @@ import re
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import safefile  # noqa: E402  (needs our own directory on the path first)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# Locate shared modules: repo flat layout, $JARVIS_DIR/lib, or sibling lib/.
+for _c in (_HERE, os.path.join(_HERE, "lib"),
+           os.path.join(os.path.dirname(_HERE), "lib")):
+    _abs = os.path.abspath(_c)
+    if os.path.isfile(os.path.join(_abs, "safefile.py")):
+        if _abs not in sys.path:
+            sys.path.insert(0, _abs)
+        break
+else:
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
+import safefile  # noqa: E402
 
 HOME = os.path.expanduser("~")
 CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
